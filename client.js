@@ -981,6 +981,291 @@ window.__ModuleLoader__.load({
       return `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
     }
 
+    // ---- 纯算法：轮廓追踪 / 折线简化 / 主色聚类 ---------------------------------
+    // 写成不碰 DOM 的纯函数，方便自测；跑起来仍然只在浏览器里。
+
+    /** 把像素数据化成「墨迹掩码」：暗=墨，透明当空白。 */
+    function inkMask(data, w, h, threshold) {
+      const t = Number.isFinite(Number(threshold)) ? Number(threshold) : 0.45;
+      const mask = new Uint8Array(w * h);
+      for (let y = 0; y < h; y += 1) {
+        for (let x = 0; x < w; x += 1) {
+          const i = (y * w + x) * 4;
+          const a = data[i + 3] / 255;
+          if (a < 0.12) continue;
+          const lum = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) / 255;
+          // 深色是墨；透明底上任何不透明像素都算墨
+          const dark = 1 - lum;
+          mask[y * w + x] = dark >= t || (a < 0.98 && data[i + 3] > 40) ? 1 : 0;
+        }
+      }
+      return mask;
+    }
+
+    /** 3×3 盒子模糊两遍：让细线的两条边并成一条，追踪结果不会碎成双线。 */
+    function blurMask(mask, w, h) {
+      let src = mask;
+      for (let pass = 0; pass < 2; pass += 1) {
+        const out = new Uint8Array(w * h);
+        for (let y = 0; y < h; y += 1) {
+          for (let x = 0; x < w; x += 1) {
+            let sum = 0;
+            let n = 0;
+            for (let dy = -1; dy <= 1; dy += 1) {
+              const yy = y + dy;
+              if (yy < 0 || yy >= h) continue;
+              for (let dx = -1; dx <= 1; dx += 1) {
+                const xx = x + dx;
+                if (xx < 0 || xx >= w) continue;
+                sum += src[yy * w + xx];
+                n += 1;
+              }
+            }
+            out[y * w + x] = sum / n >= 0.5 ? 1 : 0;
+          }
+        }
+        src = out;
+      }
+      return src;
+    }
+
+    /** Ramer–Douglas–Peucker：把像素锯齿折线压成少量控制点。 */
+    function rdp(points, tolerance) {
+      if (points.length <= 2 || !(tolerance > 0)) return points;
+      const keep = new Uint8Array(points.length);
+      keep[0] = 1;
+      keep[points.length - 1] = 1;
+      const stack = [[0, points.length - 1]];
+      while (stack.length) {
+        const [first, last] = stack.pop();
+        const ax = points[first][0];
+        const ay = points[first][1];
+        const bx = points[last][0];
+        const by = points[last][1];
+        const dx = bx - ax;
+        const dy = by - ay;
+        const len = Math.hypot(dx, dy) || 1e-6;
+        let index = -1;
+        let best = tolerance;
+        for (let i = first + 1; i < last; i += 1) {
+          const px = points[i][0] - ax;
+          const py = points[i][1] - ay;
+          const dist = Math.abs(px * dy - py * dx) / len;
+          if (dist > best) {
+            best = dist;
+            index = i;
+          }
+        }
+        if (index >= 0) {
+          keep[index] = 1;
+          stack.push([first, index], [index, last]);
+        }
+      }
+      return points.filter((_, i) => keep[i]);
+    }
+
+    /**
+     * Marching squares 抽等值轮廓：返回一串折线（局部像素坐标）。
+     * 输入是墨迹掩码，输出是「参考图的边界」，不是中心线——描出来就是原图的形。
+     */
+    function marchingSquares(mask, w, h) {
+      const segs = [];
+      const edgePoint = (key, x, y) => {
+        // 每条边的中点用整数 key 记，拼接时不会因浮点误差错位
+        if (key === 't') return [x * 2 + 1, y * 2];
+        if (key === 'r') return [x * 2 + 2, y * 2 + 1];
+        if (key === 'b') return [x * 2 + 1, y * 2 + 2];
+        return [x * 2, y * 2 + 1];
+      };
+      const push = (a, b) => {
+        segs.push([a, b]);
+      };
+      for (let y = 0; y < h - 1; y += 1) {
+        for (let x = 0; x < w - 1; x += 1) {
+          const v0 = mask[y * w + x];
+          const v1 = mask[y * w + x + 1];
+          const v2 = mask[(y + 1) * w + x + 1];
+          const v3 = mask[(y + 1) * w + x];
+          const code = (v0 << 3) | (v1 << 2) | (v2 << 1) | v3;
+          if (code === 0 || code === 15) continue;
+          const T = edgePoint('t', x, y);
+          const R = edgePoint('r', x, y);
+          const B = edgePoint('b', x, y);
+          const L = edgePoint('l', x, y);
+          switch (code) {
+            case 1: case 14: push(L, B); break;
+            case 2: case 13: push(B, R); break;
+            case 3: case 12: push(L, R); break;
+            case 4: case 11: push(T, R); break;
+            case 6: case 9: push(T, B); break;
+            case 7: case 8: push(L, T); break;
+            // 5 / 10 是鞍点，两条都要出
+            case 5: push(L, T); push(B, R); break;
+            case 10: push(T, R); push(L, B); break;
+            default: break;
+          }
+        }
+      }
+      return segs;
+    }
+
+    /** 把线段拼成折线：端点 key 相同的接起来，闭合的就首尾相连。 */
+    function stitchSegments(segs) {
+      const keyOf = (p) => `${p[0]},${p[1]}`;
+      const byKey = new Map();
+      segs.forEach((seg, i) => {
+        for (const p of seg) {
+          const k = keyOf(p);
+          const list = byKey.get(k);
+          if (list) list.push(i);
+          else byKey.set(k, [i]);
+        }
+      });
+      const used = new Set();
+      const lines = [];
+      for (let i = 0; i < segs.length; i += 1) {
+        if (used.has(i)) continue;
+        used.add(i);
+        const line = [segs[i][0], segs[i][1]];
+        // 往后接
+        for (;;) {
+          const tailKey = keyOf(line[line.length - 1]);
+          const next = (byKey.get(tailKey) || []).find((j) => !used.has(j));
+          if (next === undefined) break;
+          used.add(next);
+          const seg = segs[next];
+          const p = keyOf(seg[0]) === tailKey ? seg[1] : seg[0];
+          line.push(p);
+          if (keyOf(p) === keyOf(line[0])) break; // 闭环
+        }
+        // 往前接（开路径的情况）
+        for (;;) {
+          const headKey = keyOf(line[0]);
+          const prev = (byKey.get(headKey) || []).find((j) => !used.has(j));
+          if (prev === undefined) break;
+          used.add(prev);
+          const seg = segs[prev];
+          const p = keyOf(seg[0]) === headKey ? seg[1] : seg[0];
+          line.unshift(p);
+        }
+        lines.push(line);
+      }
+      return lines;
+    }
+
+    /**
+     * 参考图 → 折线：掩码 → 模糊 → 轮廓 → 简化 → 过滤碎片。
+     * 输出坐标是这块区域内的像素坐标（半像素精度），调用方自己加偏移。
+     */
+    function traceInk(imageData, w, h, opts = {}) {
+      const tolerance = Math.max(0.5, Number(opts.tolerance) || 2.5);
+      const minLength = Math.max(2, Number(opts.minLength) || 12);
+      const maxLines = Math.max(1, Number(opts.maxLines) || 80);
+      const maxPointsPerLine = Math.max(6, Number(opts.maxPointsPerLine) || 160);
+      const mask = blurMask(inkMask(imageData, w, h, opts.threshold), w, h);
+      const lines = stitchSegments(marchingSquares(mask, w, h));
+      const out = [];
+      let dropped = 0;
+      for (const raw of lines) {
+        const pts = raw.map((p) => [p[0] / 2, p[1] / 2]);
+        // 闭合环去掉重复的末点（draw 会自己收尾）
+        const a = pts[0];
+        const b = pts[pts.length - 1];
+        if (pts.length > 3 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 1.5) pts.pop();
+        let len = 0;
+        for (let i = 1; i < pts.length; i += 1) len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+        if (len < minLength) {
+          dropped += 1;
+          continue;
+        }
+        let simplified = rdp(pts, tolerance);
+        if (simplified.length > maxPointsPerLine) {
+          const stepN = Math.ceil(simplified.length / maxPointsPerLine);
+          simplified = simplified.filter((_, i) => i % stepN === 0 || i === simplified.length - 1);
+        }
+        out.push(simplified.map((p) => [Number(p[0].toFixed(1)), Number(p[1].toFixed(1))]));
+        if (out.length >= maxLines) break;
+      }
+      const points = out.reduce((n, l) => n + l.length, 0);
+      return { paths: out, lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
+    }
+
+    /** 主色聚类：真 k-means（初值取量化后占比最高的几档，10 轮迭代）。 */
+    function kmeansColors(data, k, stepPx = 2) {
+      const samples = [];
+      for (let i = 0; i < data.length; i += 4 * stepPx) {
+        if (data[i + 3] < 16) continue;
+        samples.push([data[i], data[i + 1], data[i + 2]]);
+      }
+      if (samples.length === 0) throw new Error('这块区域里没有不透明的像素');
+      const kk = Math.max(2, Math.min(8, Math.round(k)));
+      // 初值：先按 5 位量化统计，取占比最高的 kk 档的均值
+      const buckets = new Map();
+      for (const s of samples) {
+        const key = ((s[0] >> 3) << 10) | ((s[1] >> 3) << 5) | (s[2] >> 3);
+        const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
+        cur.r += s[0];
+        cur.g += s[1];
+        cur.b += s[2];
+        cur.n += 1;
+        buckets.set(key, cur);
+      }
+      let centers = [...buckets.values()]
+        .sort((a, b) => b.n - a.n)
+        .slice(0, kk)
+        .map((v) => [v.r / v.n, v.g / v.n, v.b / v.n]);
+      while (centers.length < kk) centers.push([255, 255, 255]);
+      for (let iter = 0; iter < 10; iter += 1) {
+        const sums = centers.map(() => [0, 0, 0, 0]);
+        for (const s of samples) {
+          let best = 0;
+          let bestD = Infinity;
+          for (let c = 0; c < centers.length; c += 1) {
+            const dr = s[0] - centers[c][0];
+            const dg = s[1] - centers[c][1];
+            const db = s[2] - centers[c][2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bestD) {
+              bestD = d;
+              best = c;
+            }
+          }
+          const acc = sums[best];
+          acc[0] += s[0];
+          acc[1] += s[1];
+          acc[2] += s[2];
+          acc[3] += 1;
+        }
+        centers = sums.map((acc, i) => (acc[3] ? [acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]] : centers[i]));
+      }
+      // 用最终中心再数一遍归属，算占比
+      const counts = centers.map(() => 0);
+      for (const s of samples) {
+        let best = 0;
+        let bestD = Infinity;
+        for (let c = 0; c < centers.length; c += 1) {
+          const dr = s[0] - centers[c][0];
+          const dg = s[1] - centers[c][1];
+          const db = s[2] - centers[c][2];
+          const d = dr * dr + dg * dg + db * db;
+          if (d < bestD) {
+            bestD = d;
+            best = c;
+          }
+        }
+        counts[best] += 1;
+      }
+      return centers
+        .map((c, i) => ({
+          hex: toHex(Math.round(c[0]), Math.round(c[1]), Math.round(c[2])),
+          rgb: [Math.round(c[0]), Math.round(c[1]), Math.round(c[2])],
+          ratio: Number(((counts[i] / samples.length) * 100).toFixed(1)),
+          pixels: counts[i],
+        }))
+        .filter((c) => c.pixels > 0)
+        .sort((a, b) => b.ratio - a.ratio);
+    }
+
     /**
      * 宿主塞过来的像素任务：全部在这里用 <canvas> 算完再回传。
      * 宿主只搬运结果，不引任何图像解码依赖。
@@ -1147,6 +1432,30 @@ window.__ModuleLoader__.load({
         return { ok: true, dataUrl: diff.toDataURL('image/png'), rect, metrics };
       }
 
+      if (kind === 'trace') {
+        const layer = params.layer
+          ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
+          : refLayerOf(doc);
+        if (!layer) throw new Error('画布上没有可用的参考图：先 import 一张');
+        const W = doc.width || 1024;
+        const H = doc.height || 1024;
+        const c = surface(W, H);
+        const g = c.getContext('2d');
+        g.clearRect(0, 0, W, H);
+        drawImageLayer(g, layer.image);
+        const rect = parseRectIn(params.rect, doc);
+        const img = g.getImageData(rect.x, rect.y, rect.w, rect.h);
+        const t = traceInk(img.data, rect.w, rect.h, {
+          threshold: params.threshold,
+          tolerance: params.tolerance,
+          minLength: params.minLength,
+          maxLines: params.maxLines,
+        });
+        // 区域内的坐标 → 画布坐标，模型可以直接喂 draw
+        const paths = t.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
+        return { ok: true, rect, paths, lines: t.lines, points: t.points, dropped: t.dropped, tolerance: t.tolerance, threshold: t.threshold };
+      }
+
       if (kind === 'palette') {
         const layer = params.layer
           ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
@@ -1161,39 +1470,17 @@ window.__ModuleLoader__.load({
         const rect = parseRectIn(params.rect, doc);
         const data = g.getImageData(rect.x, rect.y, rect.w, rect.h).data;
         const k = Math.max(2, Math.min(8, Math.round(Number(params.k) || 6)));
-        // 5 位量化后统计（比真 k-means 稳、快，对复刻够用）
-        const buckets = new Map();
-        let total = 0;
-        for (let i = 0; i < data.length; i += 4 * 4) {
-          if (data[i + 3] < 16) continue;
-          const r = data[i];
-          const gg = data[i + 1];
-          const b = data[i + 2];
-          const key = ((r >> 3) << 10) | ((gg >> 3) << 5) | (b >> 3);
-          const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
-          cur.r += r;
-          cur.g += gg;
-          cur.b += b;
-          cur.n += 1;
-          buckets.set(key, cur);
-          total += 1;
-        }
-        if (!total) throw new Error('这块区域里没有不透明的像素');
-        const colors = [...buckets.values()]
-          .sort((a, b) => b.n - a.n)
-          .slice(0, k)
-          .map((v) => ({
-            hex: toHex(Math.round(v.r / v.n), Math.round(v.g / v.n), Math.round(v.b / v.n)),
-            ratio: Number(((v.n / total) * 100).toFixed(1)),
-            pixels: v.n,
-          }));
-        return { ok: true, colors, sampled: total, rect };
+        // 真 k-means（初值取占比最高的几档，10 轮迭代），比纯量化更能抓住渐变
+        const colors = kmeansColors(data, k);
+        const sampled = colors.reduce((n, c) => n + c.pixels, 0);
+        return { ok: true, colors, sampled, rect, method: 'kmeans' };
       }
 
       throw new Error(`未知像素任务：${kind}`);
     }
 
-    /** 文档里所有笔迹按全局顺序拍平，回放和计数都用它。 */    function flattenStrokes(doc) {
+    /** 文档里所有笔迹按全局顺序拍平，回放和计数都用它。 */
+    function flattenStrokes(doc) {
       const out = [];
       for (const layer of layersOf(doc)) {
         for (const s of layer.strokes || []) out.push({ layerId: layer.id, stroke: s });
@@ -3398,6 +3685,8 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
+      // 纯算法露出，供离线自测（不影响装载）
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors },
       apply(ctx) {
         let t = (k) => k;
         try {

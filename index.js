@@ -231,6 +231,8 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 **复刻一张图**照这个闭环走，不要凭缩略图估坐标：
 - \`action=ref rect=[x,y,w,h] zoom=2\` → read_image 看参考图那块细节；整张就用 \`action=ref\`（返回原图路径）。
 - \`action=pick x=… y=…\` → 读参考图某点的颜色与透明度：\`ink=true\` 说明这点在线条上，\`ink=false\` 就是空白。
+- \`action=trace\` → 参考图抽轮廓：返回一串折线 \`paths\`（画布坐标），每段直接当 \`draw\` 的 points，
+  不用自己估坐标。\`threshold\` 调深浅（照片给 0.3~0.5）、\`tolerance\` 调概括程度（默认 2.5）。
 - \`action=palette k=6\` → 参考图主色和占比，配色别猜 hex。
 - \`action=view layer="线稿" rect=… zoom=2\` → 看自己画的那一块对不对。
 - \`action=compare\` → 差分图（品红=参考有而你没画，青=你画多了）+ 数值（\`coveragePct\`、\`extraPct\`、\`meanColorDiff\`、\`topGaps\` 最漏的几块）。\`coveragePct\` 往 90+ 推，\`extraPct\` 压下去，就是收敛。
@@ -1695,7 +1697,7 @@ export function apply(ctx, config = {}) {
       properties: {
         action: {
           type: "string",
-          enum: ["doc", "draw", "view", "ref", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
+          enum: ["doc", "draw", "view", "ref", "trace", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
           description: "要执行的动作。new 是另起一幅（可先保存当前、也可用图片建画布）。",
         },
         points: {
@@ -1799,6 +1801,16 @@ export function apply(ctx, config = {}) {
           enum: ["ref", "canvas"],
           description: "pick / compare / palette: 读参考图（默认，第一个图片层）还是读当前画面。",
         },
+        threshold: {
+          type: "number",
+          description: "trace: 墨迹阈值 0~1（越大越只抓深色），默认 0.45。照片类参考图给 0.3~0.5。",
+        },
+        tolerance: {
+          type: "number",
+          description: "trace: 折线简化容差（像素），默认 2.5。大一点更概括，小一点更贴边。",
+        },
+        minLength: { type: "number", description: "trace: 丢掉的短线段长度下限（像素），默认 12，用来滤掉噪点。" },
+        maxLines: { type: "number", description: "trace: 最多返回几条折线，默认 80。" },
         k: { type: "number", description: "palette: 要几档主色，默认 6（上限 8）。" },
         snapshotId: { type: "string", description: "restore: 回退到哪一版快照（snapshot 返回的 id）；不给回最近一版。" },
         label: { type: "string", description: "snapshot: 这版备注，比如「上色前」。" },
@@ -2110,8 +2122,31 @@ export function apply(ctx, config = {}) {
               hint: "参考图的这块裁切，用 read_image 看。",
             };
           }
-          case "pick": {
-            if (args.x === undefined || args.y === undefined) throw new Error("pick 需要 x 和 y（画布像素）");
+          case "trace": {
+            const job = await runPixelJob("trace", {
+              rect: parseRect(args.rect, docs.doc.width, docs.doc.height),
+              layer: args.layer === undefined ? null : args.layer,
+              threshold: args.threshold,
+              tolerance: args.tolerance,
+              minLength: args.minLength,
+              maxLines: args.maxLines,
+            });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            return {
+              ok: true,
+              revision: docs.revision,
+              rect: job.rect,
+              lines: job.lines,
+              points: job.points,
+              dropped: job.dropped,
+              tolerance: job.tolerance,
+              threshold: job.threshold,
+              paths: job.paths,
+              hint: "paths 是从参考图抽出的轮廓折线（画布坐标），每段直接当 draw 的 points 用；长图可分批 batches=[…]。"
+                + "描完用 view rect+zoom 对照，再用 compare 看 coveragePct。",
+            };
+          }
+          case "pick": {            if (args.x === undefined || args.y === undefined) throw new Error("pick 需要 x 和 y（画布像素）");
             const job = await runPixelJob("pick", {
               x: Math.round(Number(args.x)),
               y: Math.round(Number(args.y)),
