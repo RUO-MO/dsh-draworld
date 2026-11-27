@@ -1211,9 +1211,32 @@ window.__ModuleLoader__.load({
         .map((p, i) => ({ pts: p, closed: Boolean(traced.closed && traced.closed[i]), area: polygonArea(p) }))
         .filter((c) => c.closed && c.area >= minFill)
         .sort((a, b) => b.area - a.area);
+      // 轮廓嵌套：大的在外，小的在内；偶数层要填，奇数层是洞（眼睛高光之类）
+      const parents = cands.map(() => -1);
+      for (let i = 0; i < cands.length; i += 1) {
+        const p0 = cands[i].pts[0];
+        let best = -1;
+        for (let j = 0; j < i; j += 1) {
+          if (cands[j].area <= cands[i].area) continue;
+          if (!pointInPolygon(p0[0], p0[1], cands[j].pts)) continue;
+          if (best === -1 || cands[j].area < cands[best].area) best = j;
+        }
+        parents[i] = best;
+      }
+      const depths = cands.map((_, i) => {
+        let d = 0;
+        let p = parents[i];
+        while (p !== -1 && d < 8) {
+          d += 1;
+          p = parents[p];
+        }
+        return d;
+      });
       const fills = [];
-      for (const cand of cands) {
+      for (const [ci, cand] of cands.entries()) {
         if (fills.length >= maxFills) break;
+        if (depths[ci] % 2 !== 0) continue;
+        const holes = cands.filter((_, j) => parents[j] === ci).slice(0, 10);
         let x0 = Infinity;
         let y0 = Infinity;
         let x1 = -Infinity;
@@ -1236,7 +1259,12 @@ window.__ModuleLoader__.load({
         mg.moveTo(cand.pts[0][0] - x0, cand.pts[0][1] - y0);
         for (let i = 1; i < cand.pts.length; i += 1) mg.lineTo(cand.pts[i][0] - x0, cand.pts[i][1] - y0);
         mg.closePath();
-        mg.fill();
+        for (const hole of holes) {
+          mg.moveTo(hole.pts[0][0] - x0, hole.pts[0][1] - y0);
+          for (let i = 1; i < hole.pts.length; i += 1) mg.lineTo(hole.pts[i][0] - x0, hole.pts[i][1] - y0);
+          mg.closePath();
+        }
+        mg.fill('evenodd');
         // 参考图这块 + 用遮罩抠出来
         const colCan = surface(w, h);
         const cg = colCan.getContext('2d');
@@ -1270,6 +1298,7 @@ window.__ModuleLoader__.load({
         }
         fills.push({
           points: cand.pts.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]),
+          holes: holes.map((h) => h.pts.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])])),
           color: best ? best.hex : toHex(Math.round(rgb[0]), Math.round(rgb[1]), Math.round(rgb[2])),
           area: Math.round(cand.area),
         });

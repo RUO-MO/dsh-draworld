@@ -252,7 +252,7 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
 - \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，并顺带跑一次 compare，直接给出覆盖率；
-- \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字。
+- \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过，不会把高光涂掉。
 - \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
   改局部之前先设选区，就不会糊到整幅。
@@ -999,6 +999,31 @@ function clipPoints(points, sel) {
   }
   if (cur.length >= 2) runs.push(cur);
   return runs;
+}
+
+/** 点是否落在多边形内（射线法）。 */
+function pointInPoly(x, y, pts) {
+  if (!Array.isArray(pts) || pts.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i, i += 1) {
+    const xi = pts[i][0];
+    const yi = pts[i][1];
+    const xj = pts[j][0];
+    const yj = pts[j][1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi || 1e-9) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/** 这点是不是落在某块色块挖的洞里（洞是参考图的高光，不该往上涂）。 */
+function inFillHole(doc, x, y) {
+  for (const layer of doc.layers || []) {
+    for (const s of layer.strokes || []) {
+      if (s.mode !== "fill" || !Array.isArray(s.holes)) continue;
+      for (const hole of s.holes) if (pointInPoly(x, y, hole)) return true;
+    }
+  }
+  return false;
 }
 
 /** 颜色亮度：挑「最像墨」的那一档当线色。支持 {rgb} 或 {hex}。 */
@@ -2324,7 +2349,7 @@ export function apply(ctx, config = {}) {
             if (style !== "lineart" && job.fills.length > 0) {
               const layer = pickLayer(args.fillLayer || "色块");
               docs.append(
-                job.fills.map((f) => ({ mode: "fill", color: f.color, size: 1, opacity: 1, points: f.points })),
+                job.fills.map((f) => ({ mode: "fill", color: f.color, size: 1, opacity: 1, points: f.points, holes: f.holes })),
                 layer.id,
               );
               created.push({ name: layer.name, kind: "fill", items: job.fills.length });
@@ -2381,7 +2406,12 @@ export function apply(ctx, config = {}) {
               };
               rounds.push(entry);
               if (cmp.metrics.coveragePct >= target) break;
-              const gaps = (cmp.metrics.topGaps || []).slice(0, 2);
+              // 落在色块洞里的「缺口」是参考图的高光，补上去反而画脏，直接跳过
+              const allGaps = cmp.metrics.topGaps || [];
+              const gaps = allGaps
+                .filter((g) => !inFillHole(docs.doc, g.x + g.w / 2, g.y + g.h / 2))
+                .slice(0, 2);
+              entry.skippedHoles = allGaps.length - gaps.length;
               if (gaps.length === 0) break;
               let added = 0;
               for (const g of gaps) {
