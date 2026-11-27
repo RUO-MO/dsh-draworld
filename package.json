@@ -4,6 +4,15 @@
   "private": true,
   "description": "星染世界：DeepSeek Harness 里的一块真画布: a right-sidebar canvas tab plus a paint_canvas tool, so the model and the human draw on the same document.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RUO-MO/dsh-draworld.git"
+  },
+  "homepage": "https://github.com/RUO-MO/dsh-draworld#readme",
+  "bugs": {
+    "url": "https://github.com/RUO-MO/dsh-draworld/issues"
+  },
+  "keywords": ["dsh", "deepseek-harness", "plugin", "canvas", "painting", "paint_canvas"],
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
