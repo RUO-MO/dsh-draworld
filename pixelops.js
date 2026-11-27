@@ -106,9 +106,24 @@ export async function runHeadless(kind, params, doc, resolve) {
       maxLines: params.maxLines,
     });
     const paths = t.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
+    // 调 THRESHOLD/TOLERANCE/STEP 时得有反馈：给线宽分布和墨迹占比，
+    // 不然只能肉眼反复试（0.1.38 之前 trace 只回 lines/points/dropped）。
+    const mask = inkMask(cut.data, cut.w, cut.h, params.threshold);
+    let inkPx = 0;
+    for (let i = 0; i < mask.length; i += 1) inkPx += mask[i];
+    const widths = pathWidths(mask, cut.w, cut.h, t.paths);
+    const widthAvg = widths.length ? Number((widths.reduce((a, b) => a + b, 0) / widths.length).toFixed(2)) : null;
+    const stats = {
+      inkRatio: Number((inkPx / (cut.w * cut.h)).toFixed(4)),
+      widthAvg,
+      widthMin: widths.length ? Number(Math.min(...widths).toFixed(2)) : null,
+      widthMax: widths.length ? Number(Math.max(...widths).toFixed(2)) : null,
+      pointsPerLine: t.lines ? Number((t.points / t.lines).toFixed(1)) : null,
+      droppedPct: t.lines + t.dropped > 0 ? Number((t.dropped / (t.lines + t.dropped) * 100).toFixed(1)) : null,
+    };
     return {
       ok: true, rect, paths, lines: t.lines, points: t.points, dropped: t.dropped,
-      tolerance: t.tolerance, smooth: t.smooth, fit: t.fit, mode: t.mode, headless: true,
+      tolerance: t.tolerance, smooth: t.smooth, fit: t.fit, mode: t.mode, headless: true, stats,
     };
   }
   if (kind === "copy") {

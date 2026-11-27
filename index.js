@@ -1185,9 +1185,12 @@ function shapeToPoints(shape, points) {
 }
 
 export function apply(ctx, config = {}) {
-  const tool = ctx.get ? ctx.get("tools") : ctx.tools;
-  const prompt = ctx.get ? ctx.get("systemPrompt") : ctx.systemPrompt;
-  const agents = ctx.get ? ctx.get("agents") : ctx.agents;
+  // 服务不能在 apply 时直接 get：DSH 的 cordis 容器是按需注入的，
+  // ctx.get("tools") 在插件加载那一刻经常还是 undefined（0.1.39 前一直因此挂不上工具）。
+  // 先在 get 里碰碰运气，真正的来源走下面的 ctx.inject([...])。
+  let tool = ctx.get ? ctx.get("tools") : ctx.tools;
+  let prompt = ctx.get ? ctx.get("systemPrompt") : ctx.systemPrompt;
+  let agents = ctx.get ? ctx.get("agents") : ctx.agents;
   let webServer = ctx.get ? ctx.get("webServer") : ctx.webServer;
   const rootDir = path.resolve(config.dir || path.join(process.cwd(), ".dsh-draworld"));
   const paths = new PathSettings(rootDir);
@@ -1204,6 +1207,12 @@ export function apply(ctx, config = {}) {
     scope: config.toolScope === "global" ? "global" : "session",
     // 会话补绑 20 秒还没成功，会退回全局注册并把原因记在这（诊断里可见）
     scopeFallback: null,
+    // 各服务到没到位：诊断里直接列出来，省得靠 bound:false 猜
+    services: { tools: false, systemPrompt: false, agents: false, webServer: false },
+    // 最近一次绑定失败的原因（resolveAgent 找不到 / register 抛错）
+    bindError: null,
+    // 端点信息：GUI 端口每次重启都可能变，写进 endpoint.json 给脚本用
+    endpoint: null,
     // 版本自检：插件自己去 GitHub 看有没有新 Release，界面上给个提示
     update: { checkedAt: null, latest: null, hasUpdate: false, url: null, error: null, enabled: config.updateCheck !== false },
   };
@@ -1213,6 +1222,11 @@ export function apply(ctx, config = {}) {
   // 宿主这边没有图像解码依赖，硬塞 @napi-rs/canvas 会让安装变重。
   // 流程：工具 execute 把任务塞进队列 → 前端 700ms 轮询取走 → 算完 POST 回来 → 这里转成工具输出。
   const PIXEL_TIMEOUT_MS = Math.max(1500, Number(config.pixelTimeout || 5000));
+  // 整幅（1080×1440 这种）做骨架细化+折线拼接是重活，5 秒根本不够：
+  // 给这几类单独一档超时，默认 30 秒，可用 heavyTimeout 调。
+  const HEAVY_KINDS = new Set(["trace", "copy", "fill", "compare", "palette"]);
+  const HEAVY_TIMEOUT_MS = Math.max(PIXEL_TIMEOUT_MS, Number(config.heavyTimeout || 30000));
+  const timeoutFor = (kind) => (HEAVY_KINDS.has(kind) ? HEAVY_TIMEOUT_MS : PIXEL_TIMEOUT_MS);
   const jobs = new Map();
   let jobSeq = 0;
   const jobStats = { done: 0, timeout: 0, failed: 0, queued: 0, headless: 0, last: null };
@@ -1249,7 +1263,7 @@ export function apply(ctx, config = {}) {
     function enqueue() {
     jobSeq += 1;
     const id = `j${jobSeq}`;
-    const limit = Math.max(1500, Number(timeoutMs) || PIXEL_TIMEOUT_MS);
+    const limit = Math.max(1500, Number(timeoutMs) || timeoutFor(kind));
     const timer = setTimeout(() => {
       if (!jobs.has(id)) return;
       jobs.delete(id);
@@ -1404,7 +1418,7 @@ export function apply(ctx, config = {}) {
 
   /** 兜底把工具挂到插件全局：会话补绑失败时至少还能用（诊断里会标 scopeFallback）。 */
   const enableGlobalFallback = (reason) => {
-    if (state.scope === "global") return false;
+    if (state.scope === "global" && state.toolOk) return false;
     state.scope = "global";
     state.scopeFallback = String(reason || "attach-pending");
     if (prompt) {
@@ -1472,6 +1486,11 @@ export function apply(ctx, config = {}) {
     }
     bound.set(agent.id, { agent, disposers: list });
     state.toolOk = list.length > 0;
+    if (list.length === 0) {
+      state.bindError = "agent.ctx 上没有 tools/systemPrompt 的注册口（宿主版本不同？）";
+    } else {
+      state.bindError = null;
+    }
     return true;
   };
 
@@ -1502,6 +1521,7 @@ export function apply(ctx, config = {}) {
     wanted.add(id);
     const agent = resolveAgent(id);
     const didBind = agent ? bindAgent(agent) : false;
+    if (!didBind) state.bindError = `找不到会话 ${id} 的 agent（agents 服务未就绪或 id 不是 agent id）`;
     if (!didBind) {
       // 会话在 attach 之前就建好了、又拿不到 agent：定时重试，20 秒还没成再退到全局
       if (!bindRetries.has(id)) {
@@ -1581,6 +1601,26 @@ export function apply(ctx, config = {}) {
       state.routeError = `getOrigin 失败: ${(err && err.message) || err}`;
       return;
     }
+    // 端口每个进程都可能变（59311 → 54578 这种）：把端点写进数据目录，
+    // 外部脚本读 endpoint.json 就行，不用再去猜端口。
+    try {
+      const info = {
+        ok: true,
+        api: 3,
+        plugin: name,
+        version: readLocalVersion(),
+        origin: state.origin,
+        port: Number((String(state.origin).match(/:(\d+)/) || [])[1] || 0),
+        pid: process.pid,
+        dataDir: dir,
+        updatedAt: Date.now(),
+      };
+      state.endpoint = info;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, "endpoint.json"), JSON.stringify(info, null, 2), "utf8");
+    } catch {
+      /* 写不了就只留在内存里，诊断还能看到 */
+    }
     try {
       const dispose = webServer.register({
         kind: "prefix",
@@ -1610,15 +1650,23 @@ export function apply(ctx, config = {}) {
             return;
           }
 
+          // 端点：脚本先问这里（或者直接读 <数据目录>/endpoint.json），别去猜端口
+          if (route === "/endpoint" && req.method === "GET") {
+            json(res, 200, { ok: true, ...(state.endpoint || { origin: state.origin, dataDir: dir }) });
+            return;
+          }
           if (route === "/diagnostics" && req.method === "GET") {
             json(res, 200, {
               ok: true,
               api: 3,
               plugin: "@xenra/dsh-draworld",
               brushes: BRUSH_IDS.length,
-              tools: { service: Boolean(tool), ok: state.toolOk, error: state.toolError },
+              tools: { service: Boolean(tool), ok: state.toolOk, error: state.toolError, bindError: state.bindError },
+              services: state.services,
               scope: { mode: state.scope, fallback: state.scopeFallback, attached: [...wanted], bound: [...bound.keys()], retries: [...bindRetries.entries()] },
               routes: { error: state.routeError, origin: state.origin },
+              endpoint: state.endpoint,
+              timeouts: { light: PIXEL_TIMEOUT_MS, heavy: HEAVY_TIMEOUT_MS },
               doc: {
                 dir,
                 revision: docs.revision,
@@ -2713,7 +2761,9 @@ export function apply(ctx, config = {}) {
               smooth: job.smooth === undefined ? null : job.smooth,
               fit: job.fit === undefined ? null : job.fit,
               paths: job.paths,
+              stats: job.stats,
               hint: "paths 是从参考图抽出的轮廓折线（画布坐标），每段直接当 draw 的 points 用；长图可分批 batches=[…]。"
+                + "stats 给的是 inkRatio/widthAvg/widthMin/widthMax/droppedPct，调 threshold/tolerance/fitStep 时看这几个数，不用只靠肉眼。"
                 + "描完用 view rect+zoom 对照，再用 compare 看 coveragePct。",
             };
           }
@@ -2779,18 +2829,55 @@ export function apply(ctx, config = {}) {
     isConcurrencySafe: () => false,
   };
 
-  if (state.scope === "global") {
-    // 旧行为：所有会话都能看到画布工具与画布协议（会把正在做别的事的会话带偏，默认已关掉）
-    if (prompt) disposers.push(prompt.section({ name: SECTION_NAME, order: SECTION_ORDER, text: PROTOCOL }));
-    if (tool) {
+  let globalRegistered = false;
+
+  /** 服务到位后统一收口：刷新诊断字段、把等着绑的会话重绑一遍、必要时补全局注册。 */
+  const onServicesReady = () => {
+    state.services.tools = Boolean(tool);
+    state.services.systemPrompt = Boolean(prompt);
+    state.services.agents = Boolean(agents);
+    state.services.webServer = Boolean(webServer);
+    for (const id of wanted) {
+      if (bound.has(id)) continue;
+      const agent = resolveAgent(id);
+      if (agent) bindAgent(agent);
+    }
+    if (state.scope === "global" && tool && !globalRegistered) {
+      if (prompt) {
+        try {
+          disposers.push(prompt.section({ name: SECTION_NAME, order: SECTION_ORDER, text: PROTOCOL }));
+        } catch (err) {
+          state.toolError = `section: ${(err && err.message) || err}`;
+        }
+      }
       try {
         disposers.push(tool.register(definition));
         state.toolOk = true;
+        globalRegistered = true;
+        state.bindError = null;
       } catch (err) {
-        state.toolError = String((err && err.message) || err);
+        state.toolError = `register: ${(err && err.message) || err}`;
       }
     }
+  };
+
+  // cordis 的服务是懒注入的：ctx.get 在 apply 那一刻常常拿不到，
+  // 必须用 ctx.inject 等回调（回调就是「该服务可用」的时刻）。
+  if (typeof ctx.inject === "function") {
+    ctx.inject(["tools"], (scope) => {
+      tool = (scope && scope.tools) || (scope && scope.get ? scope.get("tools") : null);
+      onServicesReady();
+    });
+    ctx.inject(["systemPrompt"], (scope) => {
+      prompt = (scope && scope.systemPrompt) || (scope && scope.get ? scope.get("systemPrompt") : null);
+      onServicesReady();
+    });
+    ctx.inject(["agents"], (scope) => {
+      agents = (scope && scope.agents) || (scope && scope.get ? scope.get("agents") : null);
+      onServicesReady();
+    });
   }
+  onServicesReady();
 
   if (webServer) mount();
   else if (typeof ctx.inject === "function") {

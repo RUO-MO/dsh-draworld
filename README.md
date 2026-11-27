@@ -16,9 +16,17 @@
 
 ## 安装
 
-插件是本地目录安装，没有第三方依赖（纯 ESM，渲染在浏览器里做）。两种装法：
+插件没有第三方依赖（纯 ESM，渲染在浏览器里做）。三种装法：
 
-**A. 从仓库地址装（推荐，便于更新）**
+**A. 从 npm 装（推荐：管理页会显示「版本 / 可更新到 x」，能一键更新）**
+
+```
+@xenra/dsh-draworld
+```
+
+装完在插件详情里就有「版本」区块（`可更新到 x.y.z` / `已是最新` / `上次检查于`）和原生「更新」按钮——这块只有注册表安装才渲染，git 安装没有。
+
+**B. 从仓库地址装（便于改源码，但没有管理页的版本区块）**
 
 在 DeepSeek Harness 的插件管理里填安装地址，任选其一：
 
@@ -28,17 +36,18 @@ https://github.com/RUO-MO/dsh-draworld
 ```
 
 插件管理器会先用 `git ls-remote` 检查仓库连通性，再用 pnpm 装源码（仓库无构建脚本，`--ignore-scripts` 即可）。
-需要本机有 `git`、能访问 `github.com`；**用 https，不要用 ssh**——很多网络下 22 端口被拒。
+需要本机有 `git`、能访问 `github.com`；**用 https，不要用 ssh**——很多网络下 22 端口被拒。git 装的情况下更新走画界自己的一键更新（见下）。
 
-**B. 从本地目录装**
+**C. 从本地目录装**
 
 1. 下载 [最新 Release](https://github.com/RUO-MO/dsh-draworld/releases) 的 zip 解压，或 `git clone https://github.com/RUO-MO/dsh-draworld.git`。
 2. 插件管理里添加这个目录。
 
 装完都要**停用再启用**（宿主代码生效）；只改界面代码时 `Ctrl+R` 刷新页面即可。
-想确认装的是新版本：打开画界后访问 `http://127.0.0.1:<DSH端口>/canvas-api/diagnostics`，`api=3`、`scope.mode=session`。
+想确认装的是新版本：打开画界后访问 `http://127.0.0.1:<DSH端口>/canvas-api/diagnostics`，`api=3`、`scope.mode=session`；
+不确定端口就打开画界右列的「版本」卡，或直接读 `<数据目录>/endpoint.json`（里面有 `origin`/`port`/`pid`/`version`）。
 
-> **更新**：GitHub Release 只是下载页，不会向已装用户推送。用方式 A 装的，用同一条地址再装一次（或 `pnpm update`）就会拉到最新提交；用方式 B 装的，需要自己替换目录里的文件。插件管理器的「可更新」角标只覆盖官方目录条目，自建仓库不会显示。
+> **更新**：npm 装的，管理页自己会查、点「更新」即可；git 装的，画界右列「版本」卡里有「检查更新 / 一键更新」（走宿主 `pluginManager.updateBundle`，按 tag 重装）。两条路都不用重新找安装地址。
 
 > 插件管理按 `package.json` 的 `version` 判断版本。本地目录装了插件、文件改了但版本号没动，它不认——升级请先改版本号。
 
@@ -184,12 +193,15 @@ https://github.com/RUO-MO/dsh-draworld
 
 - **前端**：浏览器早就把参考图解码进 `<canvas>` 了，最快。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。
 - **宿主侧（0.1.35 起）**：面板没开（`/jobs` 2.5 秒没人来取）时，宿主自己算——`pixels.js` 是纯 JS 的 PNG 解码/编码（8bit，colorType 0/2/4/6，不支持调色板/隔行/16bit）+ 光栅化 + marching squares / Zhang-Suen 骨架 / RDP / Chaikin / 三次贝塞尔，`pixelops.js` 跑 crop / ref / pick / palette / trace / copy / fill / compare。所以「不开界面也能 `copy` → `fix`」这条已经通了，不再 5 秒超时。非 PNG 参考图（JPEG 等）会用 PowerShell 的 `System.Drawing` 转一次临时 PNG 再读。
-- 宿主算不出来才回落到队列，超时 5 秒、话术直说「宿主侧没算成、面板也没接任务」。不想让宿主插手、只走浏览器：插件配置写 `headless: false`（也可 `POST /canvas-api/config {"headless": false}` 临时切）。
+- 宿主算不出来才回落到队列，超时默认 5 秒（`trace`/`copy`/`fill`/`compare`/`palette` 这类整幅重活 30 秒，`heavyTimeout` 可调）、话术直说「宿主侧没算成、面板也没接任务」。不想让宿主插手、只走浏览器：插件配置写 `headless: false`（也可 `POST /canvas-api/config {"headless": false}` 临时切）。
+- **`trace` 带调参反馈（0.1.39 起）**：返回体里多了 `stats` —— `inkRatio`（墨迹占比，判断阈值是不是把阴影也吃进来了）、`widthAvg/Min/Max`（量出来的线宽，拿来设笔刷 size）、`pointsPerLine`（重采样疏密，对应 `fitStep`/`step`）、`droppedPct`（被 `minLength` 丢掉的短段比例）。调 `threshold`/`tolerance`/`fitStep` 时看这几个数，不用只靠肉眼比成品。
 - **图片类型按内容判**：`import` 不看扩展名，读魔数认 PNG / JPEG / WebP / GIF，缓存名统一是 `img-<stamp>-<rand>.<真扩展名>`；`ref` 遇到非 PNG 会先转一份 `views/ref-…-<mtime>.png` 再交给 `read_image`（同一文件按 mtime 复用，原文件保留不动）。
 
 **填色边界**：`copy` 走中心线时，色块另跑一遍边界追踪取闭合轮廓（骨架不闭合），洞按嵌套层数 even-odd 挖掉；`fill` 的泛洪边界只认笔迹（不含已填色块），区域撞到「超过画布 62%」会拒填并提示先有线稿或用 `rect` 收窄。
 
 **会话绑定**：工具和画布协议挂在 `agent.ctx` 上，只有打开过画界的会话才有。打开画界时前端 POST `/canvas-api/attach`（带 `sessionId`），关掉 15 秒后 `/detach`。attach 会先按 id 找 agent（`get` 找不到就从列表里翻），找不到就每秒重试、最多 20 秒；20 秒还拿不到就**退回全局注册**（`diagnostics.scope.fallback = "attach-pending"`），保证工具至少能用。想直接退回「所有会话都有」：插件配置写 `toolScope: "global"`（不推荐，会把正在写代码的会话带偏）。
+
+**服务是懒注入的（0.1.39 修）**：`tools` / `systemPrompt` / `agents` 不能在 `apply()` 里 `ctx.get` 一次就算——DSH 的 cordis 容器按需注入，插件加载那一刻这几个常常还是 `undefined`，于是 `paint_canvas` 永远挂不上（`diagnostics.tools.service:false`）。现在改成 `ctx.inject(["tools"|"systemPrompt"|"agents"], cb)`，服务一到位就把 `wanted` 里的会话重绑一遍，所以「先开会话、后开面板」也不会再丢工具。诊断里新增 `services`（四个服务到没到位）、`tools.bindError`（绑不上的具体原因）、`endpoint`、`timeouts`，出问题不用再猜。
 
 **单一文档**：同一缓存目录只保留一个内存文档（`Document.forDir`，按目录缓存到 `globalThis`），插件被重复加载也不会出现两份各画各的；每次请求与每次工具执行前都核对 `doc.json` mtime，别的窗口刚画过就整份换成更新的那版，避免「模型画了但界面不更新」。
 
@@ -211,6 +223,7 @@ POST /canvas-api/detach         解绑（15 秒宽限）
 GET  /canvas-api/jobs           前端取像素任务（crop / ref / pick / compare / palette）
 POST /canvas-api/job            前端回传任务结果（body: id, result）
 GET  /canvas-api/update         版本自检（`?force=1` 立刻查一次）
+GET  /canvas-api/endpoint       当前端点（origin/port/pid/version/dataDir），也落盘成 `<数据目录>/endpoint.json`
 GET  /canvas-api/image/<file>   取素材原字节
 GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本状态
 ```
