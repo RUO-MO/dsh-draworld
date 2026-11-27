@@ -162,6 +162,9 @@ window.__ModuleLoader__.load({
         taper: '起收笔渐细',
         taperHint: '手绘时两头自动变细',
         staleHost: '画界宿主还是旧进程：笔刷目前只在前端生效，落笔后会按圆头重画。到「插件管理」把画界停用再启用（或重启 DSH）后重开这一页。',
+        updateTip: '有新版本',
+        updateNow: '当前',
+        updateGo: '去 Release 下载',
         zoomFit: '适应',
         zoomActual: '1:1',
         panHint: '空格拖动/中键拖动平移，滚轮缩放',
@@ -294,6 +297,9 @@ window.__ModuleLoader__.load({
         taper: 'Taper ends',
         taperHint: 'Hand strokes thin out at both ends',
         staleHost: 'The host is still an old process: brushes only work in the preview and strokes get redrawn as round. Disable and re-enable 画界 in Plugins (or restart DSH), then reopen this page.',
+        updateTip: 'Update available',
+        updateNow: 'now',
+        updateGo: 'Get it on Releases',
         zoomFit: 'Fit',
         zoomActual: '1:1',
         panHint: 'Space or middle-drag to pan, wheel to zoom',
@@ -864,8 +870,7 @@ window.__ModuleLoader__.load({
       const w = doc.width || 1024;
       const hgt = doc.height || 1024;
       if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== hgt) canvas.height = hgt;
-      const g = canvas.getContext('2d');
+      if (canvas.height !== hgt) canvas.height = hgt;      const g = canvas.getContext('2d');
       g.save();
       g.globalCompositeOperation = 'source-over';
       g.globalAlpha = 1;
@@ -912,8 +917,283 @@ window.__ModuleLoader__.load({
       g.restore();
     }
 
-    /** 文档里所有笔迹按全局顺序拍平，回放和计数都用它。 */
-    function flattenStrokes(doc) {
+    /** 造一块离屏画布。 */
+    function surface(w, h) {
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.min(4096, Math.round(w)));
+      c.height = Math.max(1, Math.min(4096, Math.round(h)));
+      return c;
+    }
+
+    /** 只留一层（模型要"只看线稿"时用）：强制可见、不透明、正常混合。 */
+    function docOnlyLayer(doc, ref) {
+      const list = layersOf(doc);
+      if (!ref) return doc;
+      const layer = list.find((l) => l.id === ref || l.name === ref);
+      if (!layer) throw new Error(`没有这一层：${ref}`);
+      return { ...doc, layers: [{ ...layer, visible: true, opacity: 1, blend: 'normal' }] };
+    }
+
+    /** 去掉所有图片层，只留笔迹（compare 时"你画的"一侧）。 */
+    function docWithoutImages(doc) {
+      return {
+        ...doc,
+        layers: layersOf(doc).map((l) => (l.image ? { ...l, image: null } : l)),
+      };
+    }
+
+    /** 文档里第一张可见的图片层（参考图）。 */
+    function refLayerOf(doc) {
+      const list = layersOf(doc);
+      return list.find((l) => l.image && l.image.file && l.visible !== false) || list.find((l) => l.image && l.image.file) || null;
+    }
+
+    /** 把某块区域裁出来并按 zoom 放大，返回 { dataUrl, width, height }。 */
+    function cropCanvas(src, rect, zoom, background) {
+      const sx = Math.max(0, Math.round(rect.x));
+      const sy = Math.max(0, Math.round(rect.y));
+      const sw = Math.max(1, Math.round(rect.w));
+      const sh = Math.max(1, Math.round(rect.h));
+      const z = Math.max(0.2, Math.min(8, Number(zoom) || 1));
+      const out = surface(sw * z, sh * z);
+      const g = out.getContext('2d');
+      if (background) {
+        g.fillStyle = background;
+        g.fillRect(0, 0, out.width, out.height);
+      }
+      // 放大到 2 倍以上时关掉插值，让人看清像素块；缩小则保留平滑
+      g.imageSmoothingEnabled = z < 2;
+      g.drawImage(src, sx, sy, sw, sh, 0, 0, out.width, out.height);
+      return { dataUrl: out.toDataURL('image/png'), width: out.width, height: out.height, zoom: z };
+    }
+
+    function parseRectIn(rect, doc) {
+      const src = Array.isArray(rect) ? { x: rect[0], y: rect[1], w: rect[2], h: rect[3] } : (rect || {});
+      const n = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+      const x = Math.max(0, Math.round(n(src.x, 0)));
+      const y = Math.max(0, Math.round(n(src.y, 0)));
+      const w = Math.max(1, Math.round(n(src.w, (doc.width || 1024) - x)));
+      const h = Math.max(1, Math.round(n(src.h, (doc.height || 1024) - y)));
+      return { x, y, w: Math.min(w, (doc.width || 1024) - x), h: Math.min(h, (doc.height || 1024) - y) };
+    }
+
+    function toHex(r, g, b) {
+      return `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    /**
+     * 宿主塞过来的像素任务：全部在这里用 <canvas> 算完再回传。
+     * 宿主只搬运结果，不引任何图像解码依赖。
+     */
+    function runPixelTask(job, doc) {
+      if (!doc) return { ok: false, error: '文档还没加载' };
+      const kind = job.kind;
+      const params = job.params || {};
+
+      if (kind === 'crop' || kind === 'ref') {
+        const rect = parseRectIn(params.rect, doc);
+        const zoom = params.zoom === undefined ? 1 : Number(params.zoom);
+        let src = null;
+        let background = null;
+        if (kind === 'crop') {
+          const target = params.layer ? docOnlyLayer(doc, params.layer) : doc;
+          src = surface(doc.width, doc.height);
+          renderDoc(src, target, { withBackground: true });
+          background = null;
+        } else {
+          const layer = params.layer
+            ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
+            : refLayerOf(doc);
+          if (!layer) throw new Error('画布上没有可用的参考图');
+          src = surface(doc.width, doc.height);
+          const g = src.getContext('2d');
+          g.clearRect(0, 0, src.width, src.height);
+          drawImageLayer(g, layer.image);
+        }
+        const out = cropCanvas(src, rect, zoom, background);
+        return { ok: true, dataUrl: out.dataUrl, width: out.width, height: out.height, zoom: out.zoom, rect, layer: params.layer || null };
+      }
+
+      if (kind === 'pick') {
+        const x = Math.round(Number(params.x));
+        const y = Math.round(Number(params.y));
+        if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) throw new Error('pick 的坐标非法');
+        const onCanvas = params.on === 'canvas';
+        const srcDoc = onCanvas ? doc : (params.layer ? docOnlyLayer(doc, params.layer) : doc);
+        const c = surface(doc.width, doc.height);
+        renderDoc(c, srcDoc, { withBackground: onCanvas });
+        const px = c.getContext('2d').getImageData(x, y, 1, 1).data;
+        const alpha = Number((px[3] / 255).toFixed(3));
+        return {
+          ok: true,
+          x,
+          y,
+          on: onCanvas ? 'canvas' : 'ref',
+          hex: toHex(px[0], px[1], px[2]),
+          rgb: [px[0], px[1], px[2]],
+          alpha,
+          ink: alpha > 0.15,
+        };
+      }
+
+      if (kind === 'compare') {
+        const layer = params.layer
+          ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
+          : refLayerOf(doc);
+        if (!layer) throw new Error('画布上没有可用的参考图：先 import 一张');
+        const W = doc.width || 1024;
+        const H = doc.height || 1024;
+        const rect = parseRectIn(params.rect, doc);
+
+        const ref = surface(W, H);
+        const rg = ref.getContext('2d');
+        rg.clearRect(0, 0, W, H);
+        drawImageLayer(rg, layer.image);
+
+        const drawn = surface(W, H);
+        renderDoc(drawn, docWithoutImages(doc), { withBackground: false });
+
+        const rd = rg.getImageData(rect.x, rect.y, rect.w, rect.h).data;
+        const dd = drawn.getContext('2d').getImageData(rect.x, rect.y, rect.w, rect.h).data;
+        const diff = surface(rect.w, rect.h);
+        const dg = diff.getContext('2d');
+        const diffData = dg.createImageData(rect.w, rect.h);
+        const out = diffData.data;
+
+        let refInk = 0;
+        let drawInk = 0;
+        let covered = 0;
+        let extra = 0;
+        let sumDiff = 0;
+        let missedMinX = Infinity;
+        let missedMinY = Infinity;
+        let missedMaxX = -Infinity;
+        let missedMaxY = -Infinity;
+        // 32×32 的网格，用来告诉模型「哪一格还没画到」
+        const GRID = 32;
+        const cells = new Map();
+
+        for (let i = 0, p = 0; i < rd.length; i += 4, p += 1) {
+          const ra = rd[i + 3];
+          const da = dd[i + 3];
+          const isRef = ra > 12;
+          const isDraw = da > 12;
+          const px = rect.x + (p % rect.w);
+          const py = rect.y + Math.floor(p / rect.w);
+          const o = i;
+          if (isRef) refInk += 1;
+          if (isDraw) drawInk += 1;
+          if (isRef && isDraw) {
+            covered += 1;
+            sumDiff += (Math.abs(rd[i] - dd[i]) + Math.abs(rd[i + 1] - dd[i + 1]) + Math.abs(rd[i + 2] - dd[i + 2])) / 3;
+            // 两边都有：按平均色显示成暗灰，方便看出形变
+            out[o] = Math.round((rd[i] + dd[i]) / 2);
+            out[o + 1] = Math.round((rd[i + 1] + dd[i + 1]) / 2);
+            out[o + 2] = Math.round((rd[i + 2] + dd[i + 2]) / 2);
+            out[o + 3] = 140;
+          } else if (isRef) {
+            // 参考有、你没画 = 品红（漏画）
+            out[o] = 255;
+            out[o + 1] = 0;
+            out[o + 2] = 255;
+            out[o + 3] = 235;
+            if (px < missedMinX) missedMinX = px;
+            if (py < missedMinY) missedMinY = py;
+            if (px > missedMaxX) missedMaxX = px;
+            if (py > missedMaxY) missedMaxY = py;
+            const key = `${Math.floor(((px - rect.x) / rect.w) * GRID)},${Math.floor(((py - rect.y) / rect.h) * GRID)}`;
+            const cell = cells.get(key) || { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity, n: 0 };
+            cell.n += 1;
+            if (px < cell.x0) cell.x0 = px;
+            if (py < cell.y0) cell.y0 = py;
+            if (px > cell.x1) cell.x1 = px;
+            if (py > cell.y1) cell.y1 = py;
+            cells.set(key, cell);
+          } else if (isDraw) {
+            // 你画了、参考没有 = 青（多画）
+            out[o] = 0;
+            out[o + 1] = 210;
+            out[o + 2] = 255;
+            out[o + 3] = 200;
+            extra += 1;
+          }
+        }
+        dg.putImageData(diffData, 0, 0);
+
+        const gaps = [...cells.values()].sort((a, b) => b.n - a.n).slice(0, 4).map((c) => ({
+          x: Math.round(c.x0),
+          y: Math.round(c.y0),
+          w: Math.round(c.x1 - c.x0) + 1,
+          h: Math.round(c.y1 - c.y0) + 1,
+          missed: c.n,
+        }));
+
+        const metrics = {
+          rect,
+          refInkPixels: refInk,
+          drawnInkPixels: drawInk,
+          coveredPixels: covered,
+          extraPixels: extra,
+          // 参考图的笔画里，有多少被你盖住了
+          coveragePct: refInk ? Number(((covered / refInk) * 100).toFixed(1)) : 100,
+          // 你画的东西里，有多少是参考图里没有的
+          extraPct: drawInk ? Number(((extra / drawInk) * 100).toFixed(1)) : 0,
+          meanColorDiff: covered ? Number((sumDiff / covered).toFixed(1)) : null,
+          missedBounds: Number.isFinite(missedMinX)
+            ? { x: Math.round(missedMinX), y: Math.round(missedMinY), w: Math.round(missedMaxX - missedMinX) + 1, h: Math.round(missedMaxY - missedMinY) + 1 }
+            : null,
+          topGaps: gaps,
+        };
+        return { ok: true, dataUrl: diff.toDataURL('image/png'), rect, metrics };
+      }
+
+      if (kind === 'palette') {
+        const layer = params.layer
+          ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
+          : refLayerOf(doc);
+        if (!layer) throw new Error('画布上没有可用的参考图');
+        const W = doc.width || 1024;
+        const H = doc.height || 1024;
+        const c = surface(W, H);
+        const g = c.getContext('2d');
+        g.clearRect(0, 0, W, H);
+        drawImageLayer(g, layer.image);
+        const rect = parseRectIn(params.rect, doc);
+        const data = g.getImageData(rect.x, rect.y, rect.w, rect.h).data;
+        const k = Math.max(2, Math.min(8, Math.round(Number(params.k) || 6)));
+        // 5 位量化后统计（比真 k-means 稳、快，对复刻够用）
+        const buckets = new Map();
+        let total = 0;
+        for (let i = 0; i < data.length; i += 4 * 4) {
+          if (data[i + 3] < 16) continue;
+          const r = data[i];
+          const gg = data[i + 1];
+          const b = data[i + 2];
+          const key = ((r >> 3) << 10) | ((gg >> 3) << 5) | (b >> 3);
+          const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
+          cur.r += r;
+          cur.g += gg;
+          cur.b += b;
+          cur.n += 1;
+          buckets.set(key, cur);
+          total += 1;
+        }
+        if (!total) throw new Error('这块区域里没有不透明的像素');
+        const colors = [...buckets.values()]
+          .sort((a, b) => b.n - a.n)
+          .slice(0, k)
+          .map((v) => ({
+            hex: toHex(Math.round(v.r / v.n), Math.round(v.g / v.n), Math.round(v.b / v.n)),
+            ratio: Number(((v.n / total) * 100).toFixed(1)),
+            pixels: v.n,
+          }));
+        return { ok: true, colors, sampled: total, rect };
+      }
+
+      throw new Error(`未知像素任务：${kind}`);
+    }
+
+    /** 文档里所有笔迹按全局顺序拍平，回放和计数都用它。 */    function flattenStrokes(doc) {
       const out = [];
       for (const layer of layersOf(doc)) {
         for (const s of layer.strokes || []) out.push({ layerId: layer.id, stroke: s });
@@ -1144,6 +1424,8 @@ window.__ModuleLoader__.load({
       // 图层不透明度拖动时先用本地值显示，等宿主回包（700ms 轮询）再对齐，不然滑块会跳
       const [optOpacity, setOptOpacity] = React.useState(null);
       const [playing, setPlaying] = React.useState(false);
+      /** 宿主查到的版本信息：有新版本时在标题旁边挂一枚提示。 */
+      const [updateInfo, setUpdateInfo] = React.useState(null);
       const [meta, setMeta] = React.useState({ strokes: 0, redo: 0, layers: [], activeLayer: null, background: '#ffffff', width: 1024, height: 1024 });
       const viewportRef = React.useRef(null);
       const viewRef = React.useRef({ scale: 1, x: 0, y: 0 });
@@ -1368,6 +1650,7 @@ window.__ModuleLoader__.load({
             if (!alive || !body.ok) return;
             // 宿主有没有 32 支笔刷：旧进程只认 5 支，落笔后笔刷会被丢掉，重画成圆头
             setStaleHost(!(Number(body.brushes) >= BRUSHES.length));
+            setUpdateInfo(body.update || null);
             docRef.current = body.doc;
             await ensureImages(body.doc);
             if (!alive) return;
@@ -1398,6 +1681,46 @@ window.__ModuleLoader__.load({
           if (replayRef.current) clearTimeout(replayRef.current);
         };
       }, [fitToDoc, readMeta, t, uploadPreview]);
+
+      // 像素任务：宿主把裁切/取色/差分塞进队列，这里取走、算完回传。
+      // 只在画界面板打开时存在，所以「模型要看得见」的前提是用户开着画界。
+      React.useEffect(() => {
+        let alive = true;
+        let timer = null;
+        const seen = [];
+        const drain = async () => {
+          try {
+            if (docRef.current) {
+              const res = await fetch(`${API}/jobs`, { cache: 'no-store' });
+              const body = await res.json();
+              for (const job of (body && body.jobs) || []) {
+                if (seen.includes(job.id)) continue;
+                seen.push(job.id);
+                if (seen.length > 120) seen.shift();
+                let result;
+                try {
+                  result = runPixelTask(job, docRef.current);
+                } catch (err) {
+                  result = { ok: false, error: String((err && err.message) || err) };
+                }
+                fetch(`${API}/job`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ id: job.id, result }),
+                }).catch(() => {});
+              }
+            }
+          } catch {
+            /* 宿主没开或网络抖动：下一轮再试 */
+          }
+          if (alive) timer = setTimeout(drain, 700);
+        };
+        drain();
+        return () => {
+          alive = false;
+          if (timer) clearTimeout(timer);
+        };
+      }, []);
 
       // 尺寸变化时重画（保证位图不被拉伸糊掉）
       React.useEffect(() => {
@@ -2154,6 +2477,31 @@ window.__ModuleLoader__.load({
                   background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.1))',
                 },
               }, t('staleHost'))
+              : null,
+            updateInfo && updateInfo.hasUpdate
+              ? h('div', {
+                style: {
+                  marginBottom: 6,
+                  padding: '5px 8px',
+                  borderRadius: 8,
+                  fontSize: 11,
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'center',
+                  color: 'var(--dsw-alias-label-secondary, inherit)',
+                  background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.1))',
+                  border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
+                },
+              },
+                h('span', null, `${t('updateTip')} ${updateInfo.latest}${updateInfo.local ? `（${t('updateNow')} ${updateInfo.local}）` : ''}`),
+                updateInfo.url
+                  ? h('a', {
+                    href: updateInfo.url,
+                    target: '_blank',
+                    rel: 'noreferrer',
+                    style: { color: 'var(--dsw-alias-brand-primary, inherit)', fontWeight: 600 },
+                  }, t('updateGo'))
+                  : null)
               : null,
             h('div', {
               style: {

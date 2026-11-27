@@ -149,20 +149,29 @@ https://github.com/RUO-MO/dsh-draworld
 
 ## 模型接口
 
-`paint_canvas` 一个工具，`action` 13 个：
+`paint_canvas` 一个工具，`action` 20 个：
 
 | 动作 | 说明 |
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
-| `draw` | 一笔：稀疏控制点 + 每点压感，颜色/笔宽/不透明度/笔刷/taper 自定；`layer="线稿"` 按名落层；`shape=line/rect/ellipse` 只给两个对角点 |
-| `layer` | `layerOp=list/add/select/set/remove`；`set` 改 `name`、`visible`、`layerOpacity`、`blend`；层引用认 `layer`/`layerId`/`id` |
+| `draw` | 一笔：稀疏控制点 + 每点压感，颜色/笔宽/不透明度/笔刷/taper 自定；`layer="线稿"` 按名落层；`shape=line/rect/ellipse` 只给两个对角点；`batches=[…]` 一次交多笔；`mirror=x/y` 同时镜像画 |
+| `view` | 取最新渲染；**`rect=[x,y,w,h]` 裁切 + `zoom=1~8` 放大 + `layer="线稿"` 只看单层**，并返回每层包围盒 `bbox` 与覆盖率 `inkPct` |
+| `ref` | 参考图导出：整张直接给原图路径，或 `rect`+`zoom` 裁一块出来，用 `read_image` 看细节 |
+| `pick` | 读某点颜色与透明度（`x`、`y`，`on=ref/canvas`）：`ink=true` 说明这点在线条上 |
+| `compare` | 当前画面 vs 参考图：差分图（品红=漏画、青=多画）+ `coveragePct`、`extraPct`、`meanColorDiff`、`topGaps`（最漏的几块） |
+| `palette` | 参考图主色聚类（`k` 2~8）+ 每色占比 |
+| `snapshot` / `restore` | 整幅存档 / 回到某一版（比逐笔 undo 干净，跨进程也在） |
+| `layer` | `layerOp=list/add/select/set/remove`；`set` 改 `name`、`visible`、`layerOpacity`、`blend`、`locked`（锁住就画不上去、也擦不掉） |
 | `import` | 本机图片或 dataUrl 导入成最底层；`fit=contain/cover/stretch` |
 | `canvas` | 改尺寸（16~4096）与背景 |
 | `new` | 另起一幅：可先 `save` 存当前，或给 `path`/`dataUrl` 按图建画布 |
-| `view` | 取最新渲染（带背景 PNG + 透明底 PNG 两个路径），并返回笔迹数、点数与内容范围 `bounds`，用来确认画对了 |
 | `export` | 把最新渲染另存 PNG 到保存路径（`transparent=true` 取透明底） |
 | `undo` / `redo` | 按全局顺序撤/恢复最近 N 笔 |
 | `clear` | 清空整幅；带 `layer` 只清那层（`all`/`*` 等同整幅） |
+
+**复刻一张图**的闭环：`ref` 看参考图细节 → `palette` 定配色 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
+
+**像素任务**：裁切、取色、差分、主色这些活在前端算——浏览器早就把参考图解码进 `<canvas>` 了，宿主只搬运，不引 `@napi-rs/canvas` 这类依赖。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。超时 5 秒，报错会直说「需要在浏览器里打开画界面板」。
 
 **会话绑定**：工具和画布协议挂在 `agent.ctx` 上，只有打开过画界的会话才有。打开画界时前端 POST `/canvas-api/attach`（带 `sessionId`），关掉 15 秒后 `/detach`；会话未加载时先挂起，`agent/created` 到达即补绑。想退回「所有会话都有」的旧行为：插件配置写 `toolScope: "global"`（不推荐，会把正在写代码的会话带偏）。
 
@@ -183,8 +192,11 @@ POST /canvas-api/import         导入图片成底层
 POST /canvas-api/new            新建（可先保存当前）
 POST /canvas-api/attach         把画布工具绑到会话（body: sessionId, variant）
 POST /canvas-api/detach         解绑（15 秒宽限）
+GET  /canvas-api/jobs           前端取像素任务（crop / ref / pick / compare / palette）
+POST /canvas-api/job            前端回传任务结果（body: id, result）
+GET  /canvas-api/update         版本自检（`?force=1` 立刻查一次）
 GET  /canvas-api/image/<file>   取素材原字节
-GET  /canvas-api/diagnostics    工具/路由/文档/绑定状态
+GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本状态
 ```
 
 ## 数据在哪
@@ -195,6 +207,8 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定状态
 <缓存目录>/preview.png          最近一次渲染（带背景）
 <缓存目录>/preview-alpha.png    最近一次渲染（透明底）
 <缓存目录>/images/              图片层素材
+<缓存目录>/views/               view/ref 裁切放大、compare 差分图（按时间戳留档）
+<缓存目录>/snapshots/           snapshot 存档（最近 12 版，跨进程保留）
 <保存路径>/画界-时间戳.png      另存成品；透明底带 -alpha 后缀
 ```
 
@@ -204,13 +218,17 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定状态
 
 - 升号：`node tools/bump-version.mjs`（`--dry` 只打印）
 - 常驻监听：`node tools/watch-version.mjs`，盯 `index.js`、`client.js`、`README.md`、`icon.svg`、`cordis.patch.yml`、`locale/`，停手 8 秒补丁号 +1
-- 发布：改完版本 → `git commit` → 打 tag → `gh release create v<version> --attach <zip>`；仓库 Release 里的 zip 就是可安装的完整插件
+- 发布：改完版本 → `git commit` → 打 tag → `gh release create v<version>`，再 `gh release upload <tag> <zip>`（本机 gh 不支持 `--attach`）
+- zip 用 `git archive --format=zip --prefix=dsh-draworld/ -o <zip> <tag>` 生成，仓库 Release 里的 zip 就是可安装的完整插件
+
+**更新提示**：插件自己会查有没有新版本——挂载后 3 秒查一次、之后每 6 小时查一次，画界顶栏出现「有新版本 vX（当前 vY）→ 去 Release 下载」。查版本优先用 `git ls-remote --tags`（不依赖 TLS 信任链，公司网络里 Node 的 fetch 常被中间证书拦掉），git 不可用才退到 GitHub API。不想让它上网：插件配置写 `updateCheck: false`；`pixelTimeout` 可调像素任务等待毫秒（默认 5000）。
 
 ## 已知限制
 
 - 选区（矩形/套索/魔棒）还没做，笔迹不能裁切或限制在选区内。
 - 混合模式只有 `normal` 与 `multiply`；滤镜、液化、透视变形属于像素管线，暂不做。
 - 图层不能拖动排序、合并、复制，也不能双击改名。
-- `view` 依赖界面渲染：画布标签页至少打开过一次、前端在跑，宿主才能拿到最新渲染帧。
+- `view` / `ref` / `pick` / `compare` / `palette` 依赖界面渲染：画界面板至少打开过一次、前端在跑；没开时像素任务 5 秒超时并直说原因。
+- `trace`（参考图 → 轮廓折线）还没做，目前靠 `ref` 看 + 人工给控制点；`palette` 是 5 位量化的主色统计，不是严格的 k-means。
 - 会话绑定对「打开画界之后」的请求生效；打开前发出的那一步还看不到 `paint_canvas`。
 - 界面代码改动后需要刷新一次页面才会生效；宿主代码改动需要停用再启用插件。

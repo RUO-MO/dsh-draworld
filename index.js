@@ -10,9 +10,11 @@
  *   - 前端（client.js）：把文档画到 <canvas>，接收鼠标绘制，并把渲染结果回传。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, rmSync, statSync, readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 
 export const name = "@xenra/dsh-draworld";
 
@@ -20,6 +22,7 @@ const SECTION_NAME = "canvas-paint";
 const SECTION_ORDER = 61;
 
 const DEFAULT_LAYER_NAME = "图层 1";
+const UPDATE_REPO = "RUO-MO/dsh-draworld";
 const BRUSH_IDS = [
   // 常规
   'round', 'hard', 'softround', 'ballpoint', 'marker', 'flat',
@@ -215,14 +218,24 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
    \`minSize\` 是最小笔宽比例（默认按笔刷给，0~1）。
    用法：描线用 liner/gpen/ink + taper，草稿用 pencil/sketch，排线用 charcoal，上色铺底用 wash/watercolor，
    大块厚涂用 oil/impasto，渐变和光晕用 airbrush/airnoise/glow，明确要画网点才用 halftone。
-4. 每画几笔用 \`action=view\` 看一眼渲染结果（返回 PNG 路径和内容占比），不要假设画对了。
+4. 每画几笔用 \`action=view\` 看一眼渲染结果（返回 PNG 路径、每层的包围盒与覆盖率），不要假设画对了。
+   要贴脸看细节就带 \`rect=[x,y,w,h]\` 与 \`zoom=2~4\`；只看某一层就带 \`layer="线稿"\`。
 5. 画错用 \`action=undo\` 撤掉最近一笔，撤多了用 \`action=redo\` 回来；要整幅重来才用 \`action=clear\`。
-6. 图层不只是画布边界：\`action=layer layerOp=add name="上色"\` 建层，\`layerOp=set\` 改名字/显隐/\`layerOpacity\`/\`blend\`，
+6. 图层不只是画布边界：\`action=layer layerOp=add name="上色"\` 建层，\`layerOp=set\` 改名字/显隐/\`layerOpacity\`/\`blend\`/\`locked\`，
    \`layerOp=select\` 切成当前层，\`layerOp=list\` 看全部（含每层的图片信息和笔迹数）。
-   想让某层淡一点就 \`layerOpacity=0.4\`，想做叠加效果就 \`blend=multiply\`。
+   想让某层淡一点就 \`layerOpacity=0.4\`，想做叠加效果就 \`blend=multiply\`；把参考图那一层 \`locked=true\` 就盖不上去也擦不掉。
 7. 图片当底稿：\`action=import path="D:\\\\ref\\\\pose.png"\` 会把图存进缓存目录的 images/ 并压成**最底层**（图层 1），
    默认 contain（整张居中放进画布）；之后正常 draw 就是描图。导入后图层里带 \`image\` 字段。
 8. 画布本身也能改：\`action=canvas width=… height=… background=#rrggbb\`；\`action=export\` 把当前渲染另存成 PNG。
+
+**复刻一张图**照这个闭环走，不要凭缩略图估坐标：
+- \`action=ref rect=[x,y,w,h] zoom=2\` → read_image 看参考图那块细节；整张就用 \`action=ref\`（返回原图路径）。
+- \`action=pick x=… y=…\` → 读参考图某点的颜色与透明度：\`ink=true\` 说明这点在线条上，\`ink=false\` 就是空白。
+- \`action=palette k=6\` → 参考图主色和占比，配色别猜 hex。
+- \`action=view layer="线稿" rect=… zoom=2\` → 看自己画的那一块对不对。
+- \`action=compare\` → 差分图（品红=参考有而你没画，青=你画多了）+ 数值（\`coveragePct\`、\`extraPct\`、\`meanColorDiff\`、\`topGaps\` 最漏的几块）。\`coveragePct\` 往 90+ 推，\`extraPct\` 压下去，就是收敛。
+- 一笔要多处对称就用 \`mirror="x"\` 或 \`"y"\`；一次补很多笔用 \`batches=[…]\`。
+- 大面积改写前先 \`action=snapshot label="上色前"\`，画崩了 \`action=restore\` 整幅回退（比逐笔 undo 干净）。
 
 用户也可能同时在画布上画，所以落笔前先 doc 看一眼版本，必要时以最新内容为准。`;
 
@@ -240,7 +253,70 @@ class Document {
     this.doc = null;
     this.revision = 0;
     this.writtenAt = 0;
+    this.snapshots = [];
+    this.snapSeq = 0;
     this.load();
+    this.loadSnapshots();
+  }
+
+  /** 快照目录：模型动手前存一版，画崩了整幅回退（比逐笔 undo 干净）。 */
+  get snapshotDir() {
+    return path.join(this.dir, "snapshots");
+  }
+
+  loadSnapshots() {
+    try {
+      const listDir = this.snapshotDir;
+      if (!existsSync(listDir)) return;
+      const files = readdirSync(listDir).filter((f) => f.endsWith(".json")).sort();
+      for (const f of files.slice(-6)) {
+        const raw = JSON.parse(readFileSync(path.join(listDir, f), "utf8"));
+        if (raw && raw.doc) {
+          this.snapshots.push({ id: raw.id || f.replace(/\.json$/, ""), at: raw.at || 0, label: raw.label || "", revision: raw.revision || 0, doc: raw.doc, file: path.join(listDir, f) });
+          this.snapSeq = Math.max(this.snapSeq, Number(String(raw.id || "").replace(/\D/g, "")) || 0);
+        }
+      }
+    } catch {
+      /* 快照坏了不影响画 */
+    }
+  }
+
+  /** 存一版整幅快照：内存留一份，同时落盘（进程重启后还在）。 */
+  snapshot(label) {
+    this.snapSeq += 1;
+    const id = `s${this.snapSeq}`;
+    this.snapshots.push({ id, at: Date.now(), label: String(label || ""), revision: this.revision, doc: JSON.parse(JSON.stringify(this.doc)) });
+    while (this.snapshots.length > 12) {
+      const dropped = this.snapshots.shift();
+      if (dropped && dropped.file) {
+        try {
+          rmSync(dropped.file, { force: true });
+        } catch {
+          /* 删不掉就算了 */
+        }
+      }
+    }
+    try {
+      mkdirSync(this.snapshotDir, { recursive: true });
+      const file = path.join(this.snapshotDir, `${id}.json`);
+      writeFileSync(file, JSON.stringify({ id, at: Date.now(), label: String(label || ""), revision: this.revision, doc: this.doc }));
+      this.snapshots[this.snapshots.length - 1].file = file;
+    } catch {
+      /* 落盘失败仍能用内存那份 */
+    }
+    return this.snapshots[this.snapshots.length - 1];
+  }
+
+  /** 整幅回到某一版快照（不给 id 就回最近一版）。 */
+  restore(id) {
+    const list = this.snapshots || [];
+    if (list.length === 0) throw new Error("还没有快照：先 action=snapshot");
+    const key = String(id || "").trim();
+    const entry = key ? list.find((s) => s.id === key) : list[list.length - 1];
+    if (!entry) throw new Error(`没有这版快照：${key}（现有 ${list.map((s) => s.id).join(" / ")}）`);
+    this.doc = migrateDoc(JSON.parse(JSON.stringify(entry.doc)));
+    this.bump();
+    return entry;
   }
 
   /**
@@ -495,6 +571,7 @@ class Document {
     if (patch.visible !== undefined) layer.visible = patch.visible !== false;
     if (patch.opacity !== undefined) layer.opacity = clamp01(patch.opacity);
     if (patch.blend !== undefined) layer.blend = patch.blend === "multiply" ? "multiply" : "normal";
+    if (patch.locked !== undefined) layer.locked = patch.locked === true;
     if (patch.active === true) this.doc.activeLayer = layer.id;
     this.bump();
     return layer;
@@ -512,6 +589,7 @@ class Document {
 
   append(strokes, layerRef) {
     const layer = layerRef ? this.ensureLayer(layerRef) : this.active();
+    if (layer.locked === true) throw new Error(`图层「${layer.name}」被锁定，画不上去；要动它先 action=layer layerOp=set locked=false`);
     for (const s of strokes) {
       this.doc.seq += 1;
       layer.strokes.push({
@@ -656,6 +734,7 @@ class Document {
         visible: l.visible,
         opacity: l.opacity,
         blend: l.blend,
+        locked: l.locked === true,
         strokes: l.strokes.length,
         image: l.image ? { file: l.image.file, x: l.image.x, y: l.image.y, w: l.image.w, h: l.image.h } : null,
       };
@@ -745,6 +824,156 @@ class PathSettings {
     if (Object.keys(next).length > 0) this.save();
     return next;
   }
+}
+
+/** 时间戳后缀：文件名用它排序，比毫秒数字好认。 */
+function stampNow() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+/** 插件自己的版本号：读同目录 package.json（插件被复制到 node_modules 后同样适用）。 */
+function readLocalVersion() {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const raw = JSON.parse(readFileSync(path.join(here, "package.json"), "utf8"));
+    return String(raw.version || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+/** 语义化版本比较：a>b 返回 1，相等 0，a<b 返回 -1；容忍 v 前缀与非数字段。 */
+function compareVersion(a, b) {  const pa = String(a || "").replace(/^v/i, "").split(/[.\-+]/).map((v) => Number(v) || 0);
+  const pb = String(b || "").replace(/^v/i, "").split(/[.\-+]/).map((v) => Number(v) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const x = pa[i] || 0;
+    const y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+/** 用 git 查最新的 v* tag：绕过 Node fetch 的 TLS 信任问题（公司网络里很常见）。 */
+function latestTagViaGit() {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "git",
+      ["ls-remote", "--tags", `https://github.com/${UPDATE_REPO}.git`],
+      { timeout: 8000, windowsHide: true },
+      (err, stdout) => {
+        if (err) {
+          reject(new Error(`git ls-remote 失败：${(err && err.message) || err}`));
+          return;
+        }
+        const tags = String(stdout || "")
+          .split(/\r?\n/)
+          .map((line) => (line.split("\t")[1] || "").trim())
+          .filter((ref) => ref.startsWith("refs/tags/"))
+          .map((ref) => ref.replace("refs/tags/", ""))
+          .filter((tag) => !tag.endsWith("^{}") && /^v?\d/.test(tag));
+        if (tags.length === 0) {
+          reject(new Error("仓库里还没有 tag"));
+          return;
+        }
+        tags.sort(compareVersion);
+        resolve(tags[tags.length - 1]);
+      },
+    );
+  });
+}
+
+/** rect 参数统一成分数形式：接受 [x,y,w,h] 或 {x,y,w,h}，缺省即整幅。 */
+function parseRect(input, width, height) {
+  let src = null;
+  if (Array.isArray(input) && input.length >= 4) src = { x: input[0], y: input[1], w: input[2], h: input[3] };
+  else if (input && typeof input === "object") src = input;
+  const num = (v, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const x = Math.max(0, Math.round(num(src && src.x, 0)));
+  const y = Math.max(0, Math.round(num(src && src.y, 0)));
+  const w = Math.max(1, Math.round(num(src && (src.w !== undefined ? src.w : src.width), width - x)));
+  const h = Math.max(1, Math.round(num(src && (src.h !== undefined ? src.h : src.height), height - y)));
+  return {
+    x,
+    y,
+    w: Math.min(w, width - x),
+    h: Math.min(h, height - y),
+  };
+}
+
+/** 每层的包围盒与「占了多少画布」，用来回答"哪块还没画"。 */
+function layerDetails(docx) {
+  const width = docx.width || 1024;
+  const height = docx.height || 1024;
+  const area = width * height;
+  let images = 0;
+  const layers = [];
+  for (const layer of docx.layers) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let ink = 0;
+    for (const s of layer.strokes || []) {
+      const r = (Number(s.size) || 8) / 2;
+      const pts = s.points || [];
+      for (let i = 0; i < pts.length; i += 1) {
+        const x = Number(pts[i][0]);
+        const y = Number(pts[i][1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        if (x - r < minX) minX = x - r;
+        if (y - r < minY) minY = y - r;
+        if (x + r > maxX) maxX = x + r;
+        if (y + r > maxY) maxY = y + r;
+        // 粗估涂到的面积：相邻点距离 × 笔宽
+        if (i > 0) {
+          const px = Number(pts[i - 1][0]);
+          const py = Number(pts[i - 1][1]);
+          if (Number.isFinite(px) && Number.isFinite(py)) ink += Math.hypot(x - px, y - py) * (r * 2);
+        } else {
+          ink += Math.PI * r * r;
+        }
+      }
+    }
+    if (layer.image && layer.image.w && layer.image.h) {
+      const im = layer.image;
+      minX = Math.min(minX, im.x);
+      minY = Math.min(minY, im.y);
+      maxX = Math.max(maxX, im.x + im.w);
+      maxY = Math.max(maxY, im.y + im.h);
+      ink += im.w * im.h;
+      images += 1;
+    }
+    const has = Number.isFinite(minX);
+    layers.push({
+      id: layer.id,
+      name: layer.name,
+      kind: layer.image ? "image" : "draw",
+      visible: layer.visible !== false,
+      opacity: layer.opacity === undefined ? 1 : layer.opacity,
+      blend: layer.blend || "normal",
+      locked: layer.locked === true,
+      strokes: (layer.strokes || []).length,
+      bbox: has ? { x: Math.round(minX), y: Math.round(minY), w: Math.round(maxX - minX), h: Math.round(maxY - minY) } : null,
+      inkPct: has ? Number(((Math.min(ink, area) / area) * 100).toFixed(1)) : 0,
+      image: layer.image ? { file: layer.image.file, x: layer.image.x, y: layer.image.y, w: layer.image.w, h: layer.image.h } : null,
+    });
+  }
+  return { width, height, images, layers, coveragePct: Number((layers.filter((l) => l.kind === "draw").reduce((n, l) => n + l.inkPct, 0)).toFixed(1)) };
+}
+
+/** 镜像一笔：x 轴镜像（左右对称）/ y 轴镜像（上下对称），坐标口径与画布一致。 */
+function mirrorPoints(points, axis, width, height) {
+  return points.map((p) => {
+    const x = Number(p[0]);
+    const y = Number(p[1]);
+    return [axis === "x" ? Math.round(width - x) : Math.round(x), axis === "y" ? Math.round(height - y) : Math.round(y), p[2]];
+  });
 }
 
 function json(res, status, body) {
@@ -840,6 +1069,124 @@ export function apply(ctx, config = {}) {
     // 默认按会话绑定：只有打开过画界的那个会话才看得见 paint_canvas。
     // 想退回旧行为（所有会话都有）就在插件配置里写 toolScope: "global"。
     scope: config.toolScope === "global" ? "global" : "session",
+    // 版本自检：插件自己去 GitHub 看有没有新 Release，界面上给个提示
+    update: { checkedAt: null, latest: null, hasUpdate: false, url: null, error: null, enabled: config.updateCheck !== false },
+  };
+
+  // ---- 像素任务队列 -----------------------------------------------------
+  // 裁切、取色、差分这些活必须由前端算：浏览器早就把参考图解码进 <canvas> 了，
+  // 宿主这边没有图像解码依赖，硬塞 @napi-rs/canvas 会让安装变重。
+  // 流程：工具 execute 把任务塞进队列 → 前端 700ms 轮询取走 → 算完 POST 回来 → 这里转成工具输出。
+  const PIXEL_TIMEOUT_MS = Math.max(1500, Number(config.pixelTimeout || 5000));
+  const jobs = new Map();
+  let jobSeq = 0;
+  const jobStats = { done: 0, timeout: 0, failed: 0, queued: 0, last: null };
+
+  const runPixelJob = (kind, params = {}) => new Promise((resolve) => {
+    jobSeq += 1;
+    const id = `j${jobSeq}`;
+    const timer = setTimeout(() => {
+      if (!jobs.has(id)) return;
+      jobs.delete(id);
+      jobStats.timeout += 1;
+      resolve({
+        ok: false,
+        error: `像素任务超时（${Math.round(PIXEL_TIMEOUT_MS / 1000)} 秒）：${kind}。需要在浏览器里打开画界面板，渲染与解码都在前端做`,
+      });
+    }, PIXEL_TIMEOUT_MS);
+    jobs.set(id, {
+      id,
+      kind,
+      params,
+      at: Date.now(),
+      settle: (payload) => {
+        clearTimeout(timer);
+        jobs.delete(id);
+        resolve(payload);
+      },
+    });
+    jobStats.queued += 1;
+  });
+
+  /** 前端来取任务：返回所有还没回结果的（前端自己按 id 去重）。 */
+  const pendingJobs = () => [...jobs.values()].map((j) => ({ id: j.id, kind: j.kind, params: j.params, at: j.at }));
+
+  const settleJob = (id, payload) => {
+    const job = jobs.get(String(id || ""));
+    if (!job) return false;
+    if (payload && payload.ok) jobStats.done += 1;
+    else if (payload && payload.error === "timeout") jobStats.timeout += 1;
+    else jobStats.failed += 1;
+    jobStats.last = { id: job.id, kind: job.kind, at: Date.now() };
+    job.settle(payload || { ok: false, error: "前端没有回结果" });
+    return true;
+  };
+
+  /** 前端回传的 PNG dataURL 落盘，返回可给 read_image 的绝对路径。 */
+  const writePng = (dataUrl, prefix) => {
+    const m = /^data:image\/png;base64,(.+)$/.exec(String(dataUrl || ""));
+    if (!m) throw new Error("前端回传的不是 PNG dataURL");
+    const outDir = path.join(dir, "views");
+    mkdirSync(outDir, { recursive: true });
+    const file = path.join(outDir, `${prefix}-${stampNow()}-${jobSeq}.png`);
+    writeFileSync(file, Buffer.from(m[1], "base64"));
+    return file;
+  };
+
+  // ---- 版本自检 ---------------------------------------------------------
+  const localVersion = String(config.version || "").trim() || readLocalVersion();
+  let updateTimer = null;
+
+  const checkUpdate = async () => {
+    if (state.update.enabled === false) return state.update;
+    let latest = null;
+    let error = null;
+    // 先问 git（不依赖 TLS 信任链，公司网络里 Node 的 fetch 常被中间证书拦掉）；
+    // git 不可用时再退到 GitHub API。
+    try {
+      latest = await latestTagViaGit();
+    } catch (gitErr) {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
+          signal: ctrl.signal,
+          headers: { Accept: "application/vnd.github+json", "User-Agent": "@xenra/dsh-draworld" },
+        });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`GitHub ${res.status}`);
+        const body = await res.json();
+        latest = String(body.tag_name || "").replace(/^v/, "").trim() || null;
+      } catch (err) {
+        error = `${(gitErr && gitErr.message) || gitErr} / ${(err && err.message) || err}`;
+      }
+    }
+    if (!latest) {
+      state.update = { ...state.update, checkedAt: Date.now(), error: error || "没拿到版本信息" };
+      return state.update;
+    }
+    const clean = String(latest).replace(/^v/, "").trim();
+    state.update = {
+      checkedAt: Date.now(),
+      latest: clean,
+      hasUpdate: Boolean(clean && localVersion && compareVersion(clean, localVersion) > 0),
+      url: `https://github.com/${UPDATE_REPO}/releases/tag/v${clean}`,
+      error: null,
+      enabled: true,
+      local: localVersion,
+    };
+    return state.update;
+  };
+
+  const scheduleUpdateCheck = () => {
+    if (state.update.enabled === false) return;
+    setTimeout(() => {
+      checkUpdate().catch(() => {});
+    }, 3000);
+    updateTimer = setInterval(() => {
+      checkUpdate().catch(() => {});
+    }, 6 * 60 * 60 * 1000);
+    if (updateTimer && typeof updateTimer.unref === "function") updateTimer.unref();
   };
 
   // ---- 会话绑定 ---------------------------------------------------------
@@ -991,7 +1338,36 @@ export function apply(ctx, config = {}) {
               },
               preview: existsSync(docs.preview) ? docs.preview : null,
               previewAlpha: existsSync(docs.previewAlpha) ? docs.previewAlpha : null,
+              jobs: { ...jobStats, pending: jobs.size },
+              update: state.update,
             });
+            return;
+          }
+
+          // 前端来取像素任务（裁切/取色/差分/主色），算完 POST 回 /job
+          if (route === "/jobs" && req.method === "GET") {
+            json(res, 200, { ok: true, revision: docs.revision, jobs: pendingJobs() });
+            return;
+          }
+          if (route === "/job" && req.method === "POST") {
+            try {
+              const body = JSON.parse((await readBody(req)) || "{}");
+              const known = settleJob(body.id, body.result || body);
+              json(res, known ? 200 : 404, { ok: known, error: known ? undefined : "没有这个任务（可能已经超时）" });
+            } catch (err) {
+              json(res, 400, { ok: false, error: String((err && err.message) || err) });
+            }
+            return;
+          }
+          // 主动查一次新版本（界面上点「检查更新」走这里）
+          if (route === "/update" && (req.method === "GET" || req.method === "POST")) {
+            try {
+              const force = url.searchParams.get("force") === "1" || req.method === "POST";
+              const result = force ? await checkUpdate() : state.update;
+              json(res, 200, { ok: true, local: localVersion, ...result });
+            } catch (err) {
+              json(res, 500, { ok: false, error: String((err && err.message) || err) });
+            }
             return;
           }
           if (route === "/doc" && req.method === "GET") {
@@ -1001,6 +1377,9 @@ export function apply(ctx, config = {}) {
               brushes: BRUSH_IDS.length,
               revision: docs.revision,
               doc: { ...docs.doc, revision: docs.revision },
+              update: state.update,
+              version: localVersion,
+              pixelJobs: jobs.size,
             });
             return;
           }
@@ -1304,15 +1683,19 @@ export function apply(ctx, config = {}) {
     name: "paint_canvas",
     description:
       "在 DSH 界面里的真画布上作画。画布由分层数据构成（每层是带压感的点序列，或一张导入的图片），用户可以同时在同一块画布上画。" +
-      "action=doc 看画布摘要；draw 提交一笔（layer 指定图层，不存在会自动建；shape 可画直线/矩形/椭圆）；view 取最新渲染结果；" +
-      "undo / redo 撤销重做；clear 清空（给 layer 只清那层）；layer 增删改图层（name/visible/layerOpacity/blend）；" +
+      "action=doc 看画布摘要；draw 提交一笔（layer 指定图层，不存在会自动建；shape 可画直线/矩形/椭圆，batches 一次多笔）；" +
+      "view 取最新渲染结果（rect 裁切、zoom 放大、layer 只看单层，并给每层的包围盒与覆盖率）；" +
+      "ref 把参考图（或它的一块裁切）导出成 PNG，用 read_image 直接看；pick 读某点的颜色/透明度；" +
+      "compare 出「当前画面 vs 参考图」的差分图和数值；palette 提参考图主色；" +
+      "snapshot / restore 整幅存档与回退；undo / redo 撤销重做；clear 清空（给 layer 只清那层）；" +
+      "layer 增删改图层（name/visible/layerOpacity/blend/locked）；" +
       "import 把本机图片导入成最底下的图片层（path 或 dataUrl）；canvas 改画布尺寸和背景；export 把当前渲染另存成 PNG。",
     parameters: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["doc", "draw", "view", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
+          enum: ["doc", "draw", "view", "ref", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
           description: "要执行的动作。new 是另起一幅（可先保存当前、也可用图片建画布）。",
         },
         points: {
@@ -1390,6 +1773,36 @@ export function apply(ctx, config = {}) {
           description: "new: 先把当前这幅保存成 PNG（落到保存路径），再重置画布。",
         },
         count: { type: "number", description: "undo / redo: 处理几笔，默认 1。" },
+        rect: {
+          type: "array",
+          description: "view / ref / pick / compare / palette: 关注的区域 [x,y,w,h]（画布像素）。不给就是整幅；复刻时用它能贴脸看五官、转角、衣褶。",
+          items: { type: "number" },
+        },
+        zoom: {
+          type: "number",
+          description: "view / ref: 裁切后放大到多少倍（1=原像素，2=看见像素块），默认 1，上限 8。配合 rect 用。",
+        },
+        batches: {
+          type: "array",
+          description: "draw: 一次提交多笔 [[{points,color,size,brush,…},…]]，省往返；每笔字段和单笔 draw 一样。",
+          items: { type: "object", additionalProperties: true },
+        },
+        mirror: {
+          type: "string",
+          enum: ["x", "y"],
+          description: "draw: 同时镜像画一笔，x=左右对称、y=上下对称（复刻人像/建筑用）。",
+        },
+        x: { type: "number", description: "pick: 要读颜色的点 x（画布像素）。" },
+        y: { type: "number", description: "pick: 要读颜色的点 y（画布像素）。" },
+        on: {
+          type: "string",
+          enum: ["ref", "canvas"],
+          description: "pick / compare / palette: 读参考图（默认，第一个图片层）还是读当前画面。",
+        },
+        k: { type: "number", description: "palette: 要几档主色，默认 6（上限 8）。" },
+        snapshotId: { type: "string", description: "restore: 回退到哪一版快照（snapshot 返回的 id）；不给回最近一版。" },
+        label: { type: "string", description: "snapshot: 这版备注，比如「上色前」。" },
+        locked: { type: "boolean", description: "layer.set：锁定这层（参考图锁住，模型就盖不上去，也不会被误擦）。" },
       },
       required: ["action"],
       additionalProperties: false,
@@ -1456,10 +1869,31 @@ export function apply(ctx, config = {}) {
           case "doc":
             return { ok: true, ...docs.summary(), dir };
           case "draw": {
-            const source = args.shape ? shapeToPoints(args.shape, args.points) : args.points;
-            const points = normalizePoints(source, docs.doc.width, docs.doc.height);
-            const layer = docs.append([
-              {
+            const W = docs.doc.width;
+            const H = docs.doc.height;
+            const batch = Array.isArray(args.batches) ? args.batches : null;
+            const list = [];
+            if (batch) {
+              if (batch.length === 0) throw new Error("batches 是空的");
+              if (batch.length > 200) throw new Error("一次最多 200 笔，多了分几次");
+              for (const item of batch) {
+                const src = item && item.shape ? shapeToPoints(item.shape, item.points) : (item && item.points);
+                const points = normalizePoints(src, W, H);
+                list.push({
+                  color: item.color || args.color || "#111111",
+                  size: item.size || args.size || 8,
+                  opacity: item.opacity === undefined ? (args.opacity === undefined ? 1 : args.opacity) : item.opacity,
+                  mode: (item.eraser === true || args.eraser) ? "eraser" : "brush",
+                  brush: item.brush || args.brush,
+                  taper: item.taper === undefined ? args.taper === true : item.taper === true,
+                  minSize: item.minSize === undefined ? args.minSize : item.minSize,
+                  points,
+                });
+              }
+            } else {
+              const source = args.shape ? shapeToPoints(args.shape, args.points) : args.points;
+              const points = normalizePoints(source, W, H);
+              list.push({
                 color: args.color || "#111111",
                 size: args.size || 8,
                 opacity: args.opacity === undefined ? 1 : args.opacity,
@@ -1468,12 +1902,17 @@ export function apply(ctx, config = {}) {
                 taper: args.taper === true,
                 minSize: args.minSize,
                 points,
-              },
-            ], args.layer);
+              });
+            }
+            // 镜像：一笔画两边（对称复刻人像/建筑）
+            const axis = args.mirror === "x" || args.mirror === "y" ? args.mirror : null;
+            const strokes = axis ? list.concat(list.map((s) => ({ ...s, points: mirrorPoints(s.points, axis, W, H) }))) : list;
+            const layer = docs.append(strokes, args.layer);
             return {
               ok: true,
               revision: docs.revision,
               layer: { id: layer.id, name: layer.name },
+              added: strokes.length,
               ...docs.summary(),
             };
           }
@@ -1501,6 +1940,7 @@ export function apply(ctx, config = {}) {
               if (args.visible !== undefined) patch.visible = args.visible;
               if (args.layerOpacity !== undefined) patch.opacity = args.layerOpacity;
               if (args.blend !== undefined) patch.blend = args.blend;
+              if (args.locked !== undefined) patch.locked = args.locked === true;
               const layer = docs.updateLayer(target, patch);
               return {
                 ok: true,
@@ -1511,6 +1951,7 @@ export function apply(ctx, config = {}) {
                   visible: layer.visible,
                   opacity: layer.opacity,
                   blend: layer.blend,
+                  locked: layer.locked === true,
                 },
                 layers: docs.summary().layers,
               };
@@ -1590,19 +2031,136 @@ export function apply(ctx, config = {}) {
             return { ok: true, revision: docs.revision, ...docs.summary() };
           case "view": {
             const s = docs.summary();
+            const detail = layerDetails(docs.doc);
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const wantCrop = Boolean(args.rect || args.layer || (args.zoom && args.zoom !== 1));
+            if (!wantCrop) {
+              return {
+                ok: true,
+                revision: docs.revision,
+                preview: s.preview,
+                previewAlpha: s.previewAlpha,
+                hasPreview: Boolean(s.preview),
+                width: docs.doc.width,
+                height: docs.doc.height,
+                strokes: s.strokes,
+                points: s.points,
+                bounds: s.bounds,
+                layers: detail.layers,
+                layersSummary: s.layers,
+                hint: s.preview
+                  ? "用 read_image 看这个 PNG；要贴脸看细节就带 rect=[x,y,w,h] 与 zoom=2~4，只看某一层就带 layer=\"线稿\"。"
+                  : "还没有渲染结果：在界面里打开「画界」标签页后，渲染会自动回传。",
+              };
+            }
+            const job = await runPixelJob("crop", {
+              rect,
+              zoom: args.zoom === undefined ? 1 : Number(args.zoom),
+              layer: args.layer === undefined ? null : args.layer,
+            });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            const file = writePng(job.dataUrl, "view");
             return {
               ok: true,
               revision: docs.revision,
-              preview: s.preview,
-              previewAlpha: s.previewAlpha,
-              hasPreview: Boolean(s.preview),
-              strokes: s.strokes,
-              points: s.points,
-              bounds: s.bounds,
-              layers: s.layers,
-              hint: s.preview
-                ? "用 read_image 看这个 PNG；它由界面渲染后回传，是真画布的输出。"
-                : "还没有渲染结果：在界面里打开「画布」标签页后，渲染会自动回传。",
+              path: file,
+              rect,
+              zoom: job.zoom,
+              layer: job.layer,
+              width: job.width,
+              height: job.height,
+              layers: detail.layers,
+              hint: "用 read_image 看这个 PNG；它就是这块区域按 " + job.zoom + " 倍渲染的样子。",
+            };
+          }
+          case "ref": {
+            const detail = layerDetails(docs.doc);
+            const wanted = args.layer !== undefined ? args.layer : null;
+            const target = wanted
+              ? detail.layers.find((l) => l.kind === "image" && (l.id === wanted || l.name === wanted))
+              : detail.layers.find((l) => l.kind === "image" && l.visible);
+            if (!target) throw new Error(wanted ? `没有这个图片层：${wanted}` : "画布上还没有图片层，先 action=import");
+            const copy = path.resolve(dir, target.image.file);
+            if (!existsSync(copy)) throw new Error(`参考图文件不在了：${copy}`);
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const wantCrop = Boolean(args.rect || (args.zoom && args.zoom !== 1));
+            if (!wantCrop) {
+              return {
+                ok: true,
+                revision: docs.revision,
+                path: copy,
+                layer: { id: target.id, name: target.name },
+                placement: target.image,
+                size: { width: Math.round(target.image.w), height: Math.round(target.image.h) },
+                hint: "这就是参考图原文件，用 read_image 直接看；要看某一块就带 rect=[x,y,w,h]。",
+              };
+            }
+            const job = await runPixelJob("ref", { rect, zoom: args.zoom === undefined ? 1 : Number(args.zoom), layer: target.id });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            const file = writePng(job.dataUrl, "ref");
+            return {
+              ok: true,
+              revision: docs.revision,
+              path: file,
+              rect,
+              zoom: job.zoom,
+              layer: { id: target.id, name: target.name },
+              width: job.width,
+              height: job.height,
+              hint: "参考图的这块裁切，用 read_image 看。",
+            };
+          }
+          case "pick": {
+            if (args.x === undefined || args.y === undefined) throw new Error("pick 需要 x 和 y（画布像素）");
+            const job = await runPixelJob("pick", {
+              x: Math.round(Number(args.x)),
+              y: Math.round(Number(args.y)),
+              layer: args.layer === undefined ? null : args.layer,
+              on: args.on === "canvas" ? "canvas" : "ref",
+            });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            return { ok: true, revision: docs.revision, ...job };
+          }
+          case "compare": {
+            const job = await runPixelJob("compare", {
+              rect: parseRect(args.rect, docs.doc.width, docs.doc.height),
+              layer: args.layer === undefined ? null : args.layer,
+            });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            const file = writePng(job.dataUrl, "compare");
+            return {
+              ok: true,
+              revision: docs.revision,
+              path: file,
+              rect: job.rect,
+              metrics: job.metrics,
+              hint: "read_image 看差分图（品红=参考有而你没画，青=你画多了），metrics 里是覆盖率与色差。",
+            };
+          }
+          case "palette": {
+            const k = Math.max(2, Math.min(8, Math.round(Number(args.k) || 6)));
+            const job = await runPixelJob("palette", { k, rect: parseRect(args.rect, docs.doc.width, docs.doc.height), layer: args.layer === undefined ? null : args.layer });
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            return { ok: true, revision: docs.revision, ...job };
+          }
+          case "snapshot": {
+            const entry = docs.snapshot(args.label);
+            return {
+              ok: true,
+              revision: docs.revision,
+              id: entry.id,
+              label: entry.label,
+              snapshots: docs.snapshots.map((s) => ({ id: s.id, label: s.label, at: s.at, revision: s.revision })),
+            };
+          }
+          case "restore": {
+            const entry = docs.restore(args.snapshotId || args.id);
+            return {
+              ok: true,
+              revision: docs.revision,
+              restored: entry.id,
+              label: entry.label,
+              ...docs.summary(),
             };
           }
           default:
@@ -1638,6 +2196,8 @@ export function apply(ctx, config = {}) {
       }
     });
   }
+
+  scheduleUpdateCheck();
 
   // 诊断并进了 /canvas-api 的 prefix 路由里（宿主的 register 只认 prefix/exact 两种，
   // 单独注册 exact 在部分版本上不生效，之前这个接口一直 404）
