@@ -1189,6 +1189,44 @@ window.__ModuleLoader__.load({
       return inside;
     }
 
+    /** 骨架线在每点处的墨宽：沿法线往两边数连续墨点，取中位数当作这根线的笔宽。 */
+    function pathWidth(mask, w, h, path) {
+      if (!path || path.length < 2) return 0;
+      const samples = Math.min(12, path.length);
+      const values = [];
+      for (let k = 0; k < samples; k += 1) {
+        const idx = Math.floor((k * (path.length - 1)) / Math.max(1, samples - 1));
+        const p = path[idx];
+        const q = path[Math.min(path.length - 1, idx + 1)];
+        const r = path[Math.max(0, idx - 1)];
+        const dx = q[0] - r[0];
+        const dy = q[1] - r[1];
+        const len = Math.hypot(dx, dy) || 1;
+        // 法线方向
+        const nx = -dy / len;
+        const ny = dx / len;
+        let n = 1;
+        for (const sign of [1, -1]) {
+          for (let step = 1; step <= 8; step += 1) {
+            const px = Math.round(p[0] + nx * step * sign);
+            const py = Math.round(p[1] + ny * step * sign);
+            if (px < 0 || py < 0 || px >= w || py >= h) break;
+            if (!mask[py * w + px]) break;
+            n += 1;
+          }
+        }
+        values.push(n);
+      }
+      if (values.length === 0) return 0;
+      values.sort((a, b) => a - b);
+      return values[Math.floor(values.length / 2)];
+    }
+
+    /** 一批线的墨宽（和 paths 一一对应），用来按原线宽落笔。 */
+    function pathWidths(mask, w, h, paths) {
+      return paths.map((p) => pathWidth(mask, w, h, p));
+    }
+
     /** 多边形面积（鞋带公式），用来判断这个闭合轮廓够不够大、值不值得填。 */
     function polygonArea(pts) {
       let sum = 0;
@@ -1860,8 +1898,9 @@ window.__ModuleLoader__.load({
         // 线稿墨迹占比低 → 中心线更贴原线宽；照片/色块占比高 → 沿边界
         let mode = params.mode === 'center' || params.mode === 'edge' ? params.mode : 'auto';
         let inkRatio = null;
+        let mask = null;
         if (mode === 'auto') {
-          const mask = inkMask(img.data, rect.w, rect.h, params.threshold);
+          mask = inkMask(img.data, rect.w, rect.h, params.threshold);
           let inkPx = 0;
           for (let i = 0; i < mask.length; i += 1) inkPx += mask[i];
           inkRatio = inkPx / (rect.w * rect.h);
@@ -1881,10 +1920,16 @@ window.__ModuleLoader__.load({
           ? regionFills(c, rect, traced, palette, { minFill: params.minFill, maxFills: params.maxFills || 40 })
           : [];
         const paths = traced.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
+        // 每根线的墨宽：中心线模式下量出来就是原线宽，宿主照这个 size 落笔
+        if (!mask) mask = inkMask(img.data, rect.w, rect.h, params.threshold);
+        const widths = pathWidths(mask, rect.w, rect.h, traced.paths);
+        const lineWidth = widths.length ? Number((widths.reduce((a, b) => a + b, 0) / widths.length).toFixed(2)) : null;
         return {
           ok: true,
           rect,
           paths,
+          widths,
+          lineWidth,
           closed: traced.closed,
           fills,
           palette,
@@ -4152,7 +4197,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, regionFills, thinning, skeletonPaths },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, pathWidths, regionFills, thinning, skeletonPaths },
       apply(ctx) {
         let t = (k) => k;
         try {

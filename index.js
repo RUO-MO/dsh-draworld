@@ -251,7 +251,7 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 8. 画布本身也能改：\`action=canvas width=… height=… background=#rrggbb\`；\`action=export\` 把当前渲染另存成 PNG。
 
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
-- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，并顺带跑一次 compare，直接给出覆盖率；
+- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，每根线按量出来的原线宽落笔，并顺带跑一次 compare，直接给出覆盖率；要粗细分层加 \`splitLines=true\`；
 - \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过，不会把高光涂掉。
 - \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
@@ -1957,6 +1957,10 @@ export function apply(ctx, config = {}) {
           enum: ["edge", "center"],
           description: "edge 沿墨迹边界（默认，照片/色块用）；center 取骨架中心线（线稿/细线用，描出来更贴原线宽）。copy 也认这个参数：不传则自动判断（墨迹占比 <13% 判线稿走 center，否则 edge），回报里有 mode 与 inkRatio。",
         },
+        splitLines: {
+          type: "boolean",
+          description: "copy: 按线宽把细线、粗线分到「线稿」「粗线」两层，默认 false（同一层按各自线宽落笔）。",
+        },
         clearSelection: {
           type: "boolean",
           description: "select: 清掉选区，恢复整幅可画。",
@@ -2359,14 +2363,39 @@ export function apply(ctx, config = {}) {
               const darkest = palette.length
                 ? palette.reduce((a, b) => (lumOf(a) <= lumOf(b) ? a : b))
                 : null;
-              const layer = pickLayer(args.layer || "线稿");
               const brush = BRUSH_IDS.includes(args.brush) ? args.brush : "liner";
-              const size = Math.max(1, Number(args.size) || 3);
-              const strokes = job.paths
-                .filter((p) => p && p.length >= 2)
-                .map((points) => ({ color: args.color || (darkest && darkest.hex) || "#111111", size, brush, opacity: 1, points }));
-              docs.append(strokes, layer.id);
-              created.push({ name: layer.name, kind: "line", items: strokes.length });
+              const base = Math.max(1, Number(args.size) || 3);
+              const color = args.color || (darkest && darkest.hex) || "#111111";
+              // 前端量出的每根线的墨宽（像素）：有就按原线宽落笔，不再是全场一个 size
+              const widths = Array.isArray(job.widths) ? job.widths : null;
+              const sizeOf = (i) => (widths && Number(widths[i]) > 0 ? Math.max(1, Math.min(16, Number(widths[i]))) : base);
+              const pairs = job.paths
+                .map((points, i) => ({ points, size: Number(sizeOf(i).toFixed(2)) }))
+                .filter((p) => p.points && p.points.length >= 2);
+              const strokeOf = (p) => ({ color, size: p.size, brush, opacity: 1, points: p.points });
+              // splitLines：按线宽把细线、粗线分到两层，上色/改稿时互不牵连
+              const wantSplit = args.splitLines === true && widths && pairs.length >= 4;
+              if (wantSplit) {
+                const avg = pairs.reduce((n, p) => n + p.size, 0) / pairs.length;
+                const thin = pairs.filter((p) => p.size < avg * 0.8);
+                const thick = pairs.filter((p) => p.size >= avg * 0.8);
+                if (thin.length === 0 || thick.length === 0) {
+                  const layer = pickLayer(args.layer || "线稿");
+                  docs.append(pairs.map(strokeOf), layer.id);
+                  created.push({ name: layer.name, kind: "line", items: pairs.length });
+                } else {
+                  const lineLayer = pickLayer(args.layer || "线稿");
+                  docs.append(thin.map(strokeOf), lineLayer.id);
+                  created.push({ name: lineLayer.name, kind: "line", items: thin.length });
+                  const heavyLayer = pickLayer("粗线");
+                  docs.append(thick.map(strokeOf), heavyLayer.id);
+                  created.push({ name: heavyLayer.name, kind: "line", items: thick.length });
+                }
+              } else {
+                const layer = pickLayer(args.layer || "线稿");
+                docs.append(pairs.map(strokeOf), layer.id);
+                created.push({ name: layer.name, kind: "line", items: pairs.length });
+              }
             }
             // 自动验收，让模型不用再问一次
             const cmp = await runPixelJob("compare", { rect: job.rect }, PIXEL_TIMEOUT_MS * 2);
@@ -2377,6 +2406,8 @@ export function apply(ctx, config = {}) {
               rect: job.rect,
               mode: job.mode || null,
               inkRatio: job.inkRatio === undefined ? null : job.inkRatio,
+              lineWidth: job.lineWidth === undefined ? null : job.lineWidth,
+              widths: Array.isArray(job.widths) ? job.widths : null,
               created,
               palette: job.palette,
               lines: job.lines,
