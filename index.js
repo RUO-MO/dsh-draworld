@@ -2383,14 +2383,36 @@ export function apply(ctx, config = {}) {
             const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
             const wantCrop = Boolean(args.rect || (args.zoom && args.zoom !== 1));
             if (!wantCrop) {
+              // read_image 只吃 PNG：JPEG/WebP 原文件先转一份同名 PNG 放 views/，原文件仍然保留
+              let viewPath = copy;
+              let converted = false;
+              if (!copy.toLowerCase().endsWith(".png")) {
+                try {
+                  const { loadImage, encodePng } = await import("./pixels.js");
+                  const img = await loadImage(copy);
+                  const outDir = path.join(dir, "views");
+                  mkdirSync(outDir, { recursive: true });
+                  const baseName = path.basename(copy, path.extname(copy)).replace(/[^0-9a-zA-Z_-]/g, "-").slice(0, 40) || "ref";
+                  const mtime = Math.round(statSync(copy).mtimeMs);
+                  viewPath = path.join(outDir, `ref-${baseName}-${mtime}.png`);
+                  if (!existsSync(viewPath)) writeFileSync(viewPath, encodePng(img.data, img.width, img.height));
+                  converted = true;
+                } catch (err) {
+                  viewPath = copy;
+                }
+              }
               return {
                 ok: true,
                 revision: docs.revision,
-                path: copy,
+                path: viewPath,
+                source: copy,
+                converted,
                 layer: { id: target.id, name: target.name },
                 placement: target.image,
                 size: { width: Math.round(target.image.w), height: Math.round(target.image.h) },
-                hint: "这就是参考图原文件，用 read_image 直接看；要看某一块就带 rect=[x,y,w,h]。",
+                hint: converted
+                  ? "原图不是 PNG，这里给的是转好的 PNG 副本（views/ 下，按 mtime 复用）；要贴脸看细节就带 rect=[x,y,w,h] 与 zoom=2~4。"
+                  : "这就是参考图原文件，用 read_image 直接看；要看某一块就带 rect=[x,y,w,h]。",
               };
             }
             const job = await runPixelJob("ref", { rect, zoom: args.zoom === undefined ? 1 : Number(args.zoom), layer: target.id });

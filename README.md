@@ -185,6 +185,7 @@ https://github.com/RUO-MO/dsh-draworld
 - **前端**：浏览器早就把参考图解码进 `<canvas>` 了，最快。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。
 - **宿主侧（0.1.35 起）**：面板没开（`/jobs` 2.5 秒没人来取）时，宿主自己算——`pixels.js` 是纯 JS 的 PNG 解码/编码（8bit，colorType 0/2/4/6，不支持调色板/隔行/16bit）+ 光栅化 + marching squares / Zhang-Suen 骨架 / RDP / Chaikin / 三次贝塞尔，`pixelops.js` 跑 crop / ref / pick / palette / trace / copy / fill / compare。所以「不开界面也能 `copy` → `fix`」这条已经通了，不再 5 秒超时。非 PNG 参考图（JPEG 等）会用 PowerShell 的 `System.Drawing` 转一次临时 PNG 再读。
 - 宿主算不出来才回落到队列，超时 5 秒、话术直说「宿主侧没算成、面板也没接任务」。不想让宿主插手、只走浏览器：插件配置写 `headless: false`（也可 `POST /canvas-api/config {"headless": false}` 临时切）。
+- **图片类型按内容判**：`import` 不看扩展名，读魔数认 PNG / JPEG / WebP / GIF，缓存名统一是 `img-<stamp>-<rand>.<真扩展名>`；`ref` 遇到非 PNG 会先转一份 `views/ref-…-<mtime>.png` 再交给 `read_image`（同一文件按 mtime 复用，原文件保留不动）。
 
 **填色边界**：`copy` 走中心线时，色块另跑一遍边界追踪取闭合轮廓（骨架不闭合），洞按嵌套层数 even-odd 挖掉；`fill` 的泛洪边界只认笔迹（不含已填色块），区域撞到「超过画布 62%」会拒填并提示先有线稿或用 `rect` 收窄。
 
