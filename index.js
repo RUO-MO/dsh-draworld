@@ -251,7 +251,8 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 8. 画布本身也能改：\`action=canvas width=… height=… background=#rrggbb\`；\`action=export\` 把当前渲染另存成 PNG。
 
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
-- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，描线默认走三次贝塞尔拟合（长弧一条曲线走完，比磨圆更像手画），每根线按量出来的原线宽落笔，并顺带跑一次 compare，直接给出覆盖率；要粗细分层加 \`splitLines=true\`；
+- \`action=copy style=anime\`（或 lineart / flat / paint）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，描线默认走三次贝塞尔拟合（长弧一条曲线走完，比磨圆更像手画），每根线按量出来的原线宽落笔，并顺带跑一次 compare，直接给出覆盖率；要粗细分层加 \`splitLines=true\`；
+  \`style=paint\` 是另一条路：不描闭合轮廓，先按大网格把整幅铺一遍色、再只在对比强的地方（脸、手、褶皱、火焰边缘）补细笔，颜色取局部均色、方向沿等色线——厚涂/渐变/火焰这类没有闭合边界的图用这个。默认 8000 笔出结构，\`maxStrokes=12000\` 才接近成图质感；默认不叠线稿（厚涂图没有清晰墨线，硬描会拖出大黑斜线），要叠给 \`lineart=true\`。
 - \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过，不会把高光涂掉。
 - \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
@@ -1213,6 +1214,8 @@ export function apply(ctx, config = {}) {
     bindError: null,
     // 端点信息：GUI 端口每次重启都可能变，写进 endpoint.json 给脚本用
     endpoint: null,
+    // 正在大批落笔时的进度（/doc 里带出去，侧边面板据此画进度条，不用等全部写完才看见）
+    painting: null,
     // 版本自检：插件自己去 GitHub 看有没有新 Release，界面上给个提示
     update: { checkedAt: null, latest: null, hasUpdate: false, url: null, error: null, enabled: config.updateCheck !== false },
   };
@@ -1247,6 +1250,43 @@ export function apply(ctx, config = {}) {
       jobStats.failed += 1;
       return { ok: false, error: `宿主侧算 ${kind} 失败：${(err && err.message) || err}`, headless: true };
     }
+  };
+
+  /** 让出一次事件循环：大批笔迹分块落盘时，前端 700ms 轮询才看得到中间状态。 */
+  const yieldTick = () => new Promise((resolve) => setImmediate(resolve));
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * 分块追加：一次 append 2000 笔会在最后一次性 bump，界面上就是「卡住 → 突然全出来」。
+   * 这里按 120 笔一段写，每段都 bump 一次，并把自己的进度记进 state.painting（/doc 里带出去）。
+   *
+   * 有人开着面板时还要慢放：只 yieldTick 的话 1 万笔在几十毫秒内就全落完，
+   * 700ms 的轮询只能看到最终态，等于没过程。所以按「整批放完约 2 秒」反算每块之间的停顿，
+   * 单块 15~180ms；没人看就全速，不白等。
+   */
+  const appendInChunks = async (strokes, layerRef, chunkSize = 120) => {
+    const total = strokes.length;
+    const chunks = Math.ceil(total / chunkSize);
+    const showProgress = total > chunkSize;
+    const pause = showProgress && panelLive()
+      ? Math.max(15, Math.min(180, Math.round(2000 / chunks)))
+      : 0;
+    let layer = null;
+    let done = 0;
+    for (let i = 0; i < total; i += chunkSize) {
+      const part = strokes.slice(i, i + chunkSize);
+      layer = docs.append(part, layer ? layer.id : layerRef);
+      done += part.length;
+      state.painting = showProgress
+        ? { action: "append", done, total, layer: layer.name, at: Date.now() }
+        : null;
+      if (showProgress) {
+        if (pause > 0) await sleep(pause);
+        else await yieldTick();
+      }
+    }
+    state.painting = null;
+    return layer;
   };
 
   const runPixelJob = (kind, params = {}, timeoutMs) => new Promise((resolve) => {
@@ -1722,6 +1762,7 @@ export function apply(ctx, config = {}) {
               revision: docs.revision,
               doc: { ...docs.doc, revision: docs.revision },
               update: state.update,
+              painting: state.painting,
               version: localVersion,
               pixelJobs: jobs.size,
             });
@@ -2184,9 +2225,14 @@ export function apply(ctx, config = {}) {
         fitStep: { type: "number", description: "trace / copy: 拟合后采样间距（像素），默认 3。小一点更贴原线，点也更多。" },
         style: {
           type: "string",
-          enum: ["lineart", "flat", "anime"],
-          description: "copy: 复刻风格。lineart 只出线稿；flat 只出区域色块；anime 出线稿+色块（默认）。",
+          enum: ["lineart", "flat", "anime", "paint"],
+          description: "copy: 复刻风格。lineart 只出线稿；flat 只出区域色块；anime 出线稿+色块（默认）；paint 笔触复刻——按网格铺彩色短线（颜色取局部均色、方向沿等色线、透明度随对比度），适合厚涂/渐变/火焰这种没有闭合边界的图，再叠一层线稿。",
         },
+        paintStep: { type: "number", description: "copy style=paint: 细节网格边长（像素），默认按画布面积与 maxStrokes 自动算（一般 8~24）。越小越细，笔数也越多。" },
+        maxStrokes: { type: "number", description: "copy style=paint: 笔触总额，默认 8000（上限 20000）。6000 快、看结构；12000 才接近成图质感，代价是面板重绘更慢。" },
+        paintPasses: { type: "number", description: "copy style=paint: 2=先粗铺整幅再补细节（默认），1=只粗铺（快，适合先看大关系）。" },
+        paintMinLum: { type: "number", description: "copy style=paint: 比这个亮度更白的格子当背景跳过，默认 240。" },
+        lineart: { type: "boolean", description: "copy style=paint: 是否再叠一层线稿，默认 true；只要笔触就 false。" },
         colors: { type: "number", description: "copy / posterize / palette: 主色档数 2~12（copy 默认 6，posterize 默认 8）。彩稿要火、金、肤这些颜色都出来，给 10~12。" },
         minFill: { type: "number", description: "copy: 小于多少像素的闭合区域不填色，默认 320。" },
         target: { type: "number", description: "fix: 目标覆盖率百分比，默认 90。到了就停。" },
@@ -2313,7 +2359,7 @@ export function apply(ctx, config = {}) {
             // 镜像：一笔画两边（对称复刻人像/建筑）
             const axis = args.mirror === "x" || args.mirror === "y" ? args.mirror : null;
             const strokes = axis ? list.concat(list.map((s) => ({ ...s, points: mirrorPoints(s.points, axis, W, H) }))) : list;
-            const layer = docs.append(strokes, args.layer);
+            const layer = await appendInChunks(strokes, args.layer);
             return {
               ok: true,
               revision: docs.revision,
@@ -2614,7 +2660,7 @@ export function apply(ctx, config = {}) {
             throw new Error("select 需要 rect=[x,y,w,h]、points=[[x,y]…]（套索），或 clearSelection=true 清掉");
           }
           case "copy": {
-            const style = args.style === "lineart" || args.style === "flat" ? args.style : "anime";
+            const style = args.style === "lineart" || args.style === "flat" || args.style === "paint" ? args.style : "anime";
             const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
             const job = await runPixelJob("copy", {
               rect,
@@ -2630,6 +2676,10 @@ export function apply(ctx, config = {}) {
               fit: args.fit === undefined ? true : args.fit === true,
               fitStep: args.fitStep,
               mode: args.mode,
+              paintStep: args.paintStep,
+              maxStrokes: args.maxStrokes,
+              paintPasses: args.paintPasses,
+              paintMinLum: args.paintMinLum,
             }, PIXEL_TIMEOUT_MS * 3);
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
             const created = [];
@@ -2640,16 +2690,32 @@ export function apply(ctx, config = {}) {
               if (found && !found.locked && !found.image && (found.strokes || []).length === 0) return found;
               return docs.addLayer(want || undefined);
             };
-            // 先铺色块（在线稿下面），再描线，顺序就是画师的习惯
+            // 先铺底色（笔触 / 色块都在线稿下面），再描线，顺序就是画师的习惯
+            if (style === "paint" && Array.isArray(job.paint) && job.paint.length > 0) {
+              const layer = pickLayer(args.fillLayer || "笔触");
+              await appendInChunks(
+                job.paint.map((p) => ({
+                  mode: "brush",
+                  color: p.color,
+                  size: p.size,
+                  opacity: p.opacity,
+                  brush: BRUSH_IDS.includes(args.paintBrush) ? args.paintBrush : "round",
+                  points: p.points,
+                })),
+                layer.id,
+              );
+              created.push({ name: layer.name, kind: "paint", items: job.paint.length });
+            }
             if (style !== "lineart" && job.fills.length > 0) {
               const layer = pickLayer(args.fillLayer || "色块");
-              docs.append(
+              await appendInChunks(
                 job.fills.map((f) => ({ mode: "fill", color: f.color, size: 1, opacity: 1, points: f.points, holes: f.holes })),
                 layer.id,
               );
               created.push({ name: layer.name, kind: "fill", items: job.fills.length });
             }
-            if (style !== "flat" && job.paths.length > 0) {
+            // 厚涂图没有清晰墨线，默认不描线（强行描会拖出大黑斜线）；要就显式 lineart=true
+            if (style !== "flat" && (style !== "paint" || args.lineart === true) && job.paths.length > 0) {
               const palette = job.palette || [];
               const darkest = palette.length
                 ? palette.reduce((a, b) => (lumOf(a) <= lumOf(b) ? a : b))
@@ -2672,19 +2738,19 @@ export function apply(ctx, config = {}) {
                 const thick = pairs.filter((p) => p.size >= avg * 0.8);
                 if (thin.length === 0 || thick.length === 0) {
                   const layer = pickLayer(args.layer || "线稿");
-                  docs.append(pairs.map(strokeOf), layer.id);
+                  await appendInChunks(pairs.map(strokeOf), layer.id);
                   created.push({ name: layer.name, kind: "line", items: pairs.length });
                 } else {
                   const lineLayer = pickLayer(args.layer || "线稿");
-                  docs.append(thin.map(strokeOf), lineLayer.id);
+                  await appendInChunks(thin.map(strokeOf), lineLayer.id);
                   created.push({ name: lineLayer.name, kind: "line", items: thin.length });
                   const heavyLayer = pickLayer("粗线");
-                  docs.append(thick.map(strokeOf), heavyLayer.id);
+                  await appendInChunks(thick.map(strokeOf), heavyLayer.id);
                   created.push({ name: heavyLayer.name, kind: "line", items: thick.length });
                 }
               } else {
                 const layer = pickLayer(args.layer || "线稿");
-                docs.append(pairs.map(strokeOf), layer.id);
+                await appendInChunks(pairs.map(strokeOf), layer.id);
                 created.push({ name: layer.name, kind: "line", items: pairs.length });
               }
             }
@@ -2705,6 +2771,8 @@ export function apply(ctx, config = {}) {
               palette: job.palette,
               lines: job.lines,
               fills: job.fills.length,
+              paint: Array.isArray(job.paint) ? job.paint.length : 0,
+              paintStats: job.paintStats || null,
               points: job.points,
               metrics: cmp.ok ? cmp.metrics : null,
               hint: `已按 ${style} 复刻：${created.map((c) => `${c.name}(${c.items})`).join(" + ") || "没有可画的内容"}。`
@@ -3008,3 +3076,4 @@ export function apply(ctx, config = {}) {
     }
   };
 }
+

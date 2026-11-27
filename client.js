@@ -2562,6 +2562,9 @@ window.__ModuleLoader__.load({
       const [updateInfo, setUpdateInfo] = React.useState(null);
       const [applying, setApplying] = React.useState(false);
       const [applyNote, setApplyNote] = React.useState('');
+      /** 宿主正在大批落笔时的进度（分块写入，面板能边画边看）。 */
+      const [painting, setPainting] = React.useState(null);
+      const paintingRef = React.useRef(null);
 
       /** 一键更新：宿主拿 pluginManager 按 tag 重装（git 安装也能收更新）。 */
       const applyUpdate = async () => {
@@ -2837,6 +2840,8 @@ window.__ModuleLoader__.load({
             // 宿主有没有 32 支笔刷：旧进程只认 5 支，落笔后笔刷会被丢掉，重画成圆头
             setStaleHost(!(Number(body.brushes) >= BRUSHES.length));
             setUpdateInfo(body.update || null);
+            setPainting(body.painting || null);
+            paintingRef.current = body.painting || null;
             if (body.version) setLocalVer(String(body.version));
             const prevDoc = docRef.current;
             const prevRev = revRef.current;
@@ -2862,7 +2867,8 @@ window.__ModuleLoader__.load({
           } catch {
             if (alive) setError(t('syncFailed'));
           } finally {
-            if (alive) timer = setTimeout(tick, 500);
+            // 正在落笔就加密轮询，进度条和画布才是「长出来」而不是三跳到底
+            if (alive) timer = setTimeout(tick, paintingRef.current ? 150 : 500);
           }
         };
         tick();
@@ -3331,6 +3337,44 @@ window.__ModuleLoader__.load({
             },
           }),
         ),
+        painting
+          ? h('div', {
+            style: {
+              position: 'absolute',
+              left: 8,
+              top: 8,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '4px 8px',
+              borderRadius: 6,
+              background: 'rgba(0,0,0,0.5)',
+              color: '#f2f2f2',
+              fontSize: 11,
+              pointerEvents: 'none',
+            },
+          },
+            h('span', null, `✎ ${painting.layer || ''}`),
+            h('div', {
+              style: {
+                width: 92,
+                height: 4,
+                borderRadius: 2,
+                background: 'rgba(255,255,255,0.25)',
+                overflow: 'hidden',
+              },
+            }, h('div', {
+              style: {
+                width: `${Math.min(100, Math.round(((painting.done || 0) / Math.max(1, painting.total || 1)) * 100))}%`,
+                height: '100%',
+                background: 'var(--dsw-alias-brand-primary, #4c8bf5)',
+                transition: 'width 120ms linear',
+              },
+            })),
+            h('span', { style: { fontVariantNumeric: 'tabular-nums' } },
+              `${painting.done || 0}/${painting.total || 0}`),
+          )
+          : null,
         h('div', {
           title: t('panHint'),
           style: {

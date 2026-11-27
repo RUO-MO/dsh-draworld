@@ -165,7 +165,7 @@ https://github.com/RUO-MO/dsh-draworld
 | 动作 | 说明 |
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
-| `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`）；描线默认做**三次贝塞尔拟合**（`fit=false` 退回磨圆 `smooth=0~3`）；每根线按量出来的**原线宽**落笔，`splitLines=true` 再把粗细分到「线稿 / 粗线」两层 |
+| `copy` | **一键复刻**：`style=lineart/flat/anime/paint`。lineart/flat/anime 走「抽轮廓 + 区域配色」，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`）；描线默认做**三次贝塞尔拟合**（`fit=false` 退回磨圆 `smooth=0~3`）；每根线按量出来的**原线宽**落笔，`splitLines=true` 再把粗细分到「线稿 / 粗线」两层。<br>**`style=paint`（0.1.40 起，厚涂/渐变/火焰这种没有闭合边界的图用它）**：不描轮廓，改成笔触铺色——先按大网格把整幅铺一遍（保证不留白），再只在局部对比强的地方（脸、手、褶皱、火焰边缘）补细笔；颜色取该格均色、笔触方向沿等色线、笔宽盖住格子对角线、不透明度随对比度走。默认 8000 笔出结构，`maxStrokes=12000` 接近成图质感（上限 20000）；`paintStep` 控细节网格、`paintPasses=1` 只粗铺先看大关系；默认**不叠线稿**（厚涂图硬描会拖出大黑斜线），要叠给 `lineart=true`；`paintBrush` 可选笔刷。返回 `paint`（笔数）、`paintStats`（step/coarse/cells/skippedBg/capped） |
 | `posterize` | **彩图复刻成图（0.1.40 起）**：先 k-means 量化成 `colors` 档（2~12，默认 8），再把每一色的连通区按 marching squares 轮廓各自落成一块可编辑填色（大块先垫、小块压上；细长条不过滤，避免交界白缝），建「色块」层；`lines=true` 顺手把色块边界描成「线稿」层。**彩稿用这个，别用 `copy`**——`copy` 的墨迹阈值会把黑袍当一整块墨，只出 160 根长线。`minArea`（默认面积/4000）、`maxFills`（默认 1600）、`tolerance`、`colors` 可调 |
 | `fix` | **自动补漏**：只看 compare 的 `topGaps` 重描最漏的几块，`target=90`、`maxRounds=3`，达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过（`skippedHoles`） |
 | `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调；区域里的洞按轮廓嵌套自动挖掉（`evenodd` 填充） |
@@ -186,7 +186,13 @@ https://github.com/RUO-MO/dsh-draworld
 | `undo` / `redo` | 按全局顺序撤/恢复最近 N 笔 |
 | `clear` | 清空整幅；带 `layer` 只清那层（`all`/`*` 等同整幅） |
 
-**复刻一张图**的闭环：彩稿走 `posterize`（色阶分区铺色 ± 边界线稿），线稿走 `copy`/`trace` → 再 `fix` 补漏；想手工精修再按 `ref` 看细节 → `palette` 定配色 → `trace` 抽轮廓 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
+**复刻一张图**的闭环：彩稿分两种走法——平涂/线色分明的走 `posterize`（色阶分区铺色 ± 边界线稿）；厚涂、渐变、火焰、毛发这种没有闭合边界的走 `copy style=paint`（笔触铺色，`maxStrokes=12000` 要质感）；纯线稿走 `copy`/`trace` → 再 `fix` 补漏；想手工精修再按 `ref` 看细节 → `palette` 定配色 → `trace` 抽轮廓 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
+
+**`style=paint` 复刻出来的样子**（1080×1440 彩稿 → 12000 笔触，全矢量可编辑，无图片层）：
+
+![笔触复刻](docs/assets/paint-replica.png)
+
+**大批落笔能边画边看（0.1.40 起）**：`copy` / `draw batches` 不再一次性把几千笔塞进文档末尾才刷新，而是每 120 笔一块写进去、中间让出事件循环，同时 `state.painting = {layer, done, total}` 通过 `GET /canvas-api/doc` 的 `painting` 字段给面板。侧边标签页的进度条（左上角 ✎ 层名 + `1200/8000`）就是读这个字段，停顿和「卡住不动」能一眼分清。
 
 **改局部别糊整幅**：先 `select` 框住范围（`rect` 或套索 `points`），再 `draw` / `fill`，越界点会被裁掉；改完 `select clearSelection=true`。选区存在 `doc.json` 的 `selection` 字段里，会跟着文档走。
 

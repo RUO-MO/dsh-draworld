@@ -11,6 +11,120 @@ import {
 
 const dataUrlOf = (surf) => `data:image/png;base64,${encodePng(surf.data, surf.w, surf.h).toString("base64")}`;
 
+/** 某点的亮度（0~255），越界就夹回边缘。 */
+function lumAt(data, w, h, x, y) {
+  const xi = Math.max(0, Math.min(w - 1, Math.round(x)));
+  const yi = Math.max(0, Math.min(h - 1, Math.round(y)));
+  const i = (yi * w + xi) * 4;
+  return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+}
+
+/**
+ * 笔触复刻（style=paint）：把参考图按网格取样，每格出 1~2 笔
+ * 「沿等色线方向」的短线，颜色取该格均色、笔宽取格宽、不透明度随局部对比度走。
+ *
+ * 跟 copy 的 edge/中心线不同，这不是"描轮廓"，而是像画师铺色：先大片铺，再靠笔触的边缘留给线稿层去压。
+ * 好处是不依赖闭合区域（厚涂、渐变、火焰这类没有明确边界的也能出效果），缺点是笔数多、只近似。
+ */
+function paintStrokesFromBitmap(cut, rect, palette, opts = {}) {
+  const w = cut.w;
+  const h = cut.h;
+  const d = cut.data;
+  const maxStrokes = Math.max(100, Math.min(20000, Number(opts.maxStrokes) || 8000));
+  // 网格边长跟笔数上限挂钩：粗铺吃掉约 45% 预算，剩的留给细节
+  const coarseAuto = Math.sqrt((w * h) / Math.max(200, maxStrokes * 0.45));
+  const step = Math.max(4, Math.min(48, Math.round(Number(opts.step) || coarseAuto / 2)));
+  const minLum = opts.minLum === undefined ? 240 : Number(opts.minLum);
+  const passes = Number(opts.passes) === 1 ? 1 : 2;
+  const strokes = [];
+  let cells = 0;
+  let skippedBg = 0;
+  let seed = 20261128;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  const hex2 = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
+  // 取样一格：均色 + 平均亮度 + 局部对比度（mag）
+  const sample = (cx, cy, size) => {
+    let r = 0, g = 0, b = 0, n = 0, lumSum = 0;
+    const half = Math.max(1, Math.round(size / 2));
+    const wob = Math.max(2, Math.round(size / 8));
+    for (let y = Math.round(cy) - half; y < Math.round(cy) + half; y += wob) {
+      for (let x = Math.round(cx) - half; x < Math.round(cx) + half; x += wob) {
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const i = (y * w + x) * 4;
+        if (d[i + 3] < 16) continue;
+        r += d[i]; g += d[i + 1]; b += d[i + 2];
+        n += 1;
+        lumSum += lumAt(d, w, h, x, y);
+      }
+    }
+    if (n === 0) return null;
+    const gx = lumAt(d, w, h, cx + size, cy) - lumAt(d, w, h, cx - size, cy);
+    const gy = lumAt(d, w, h, cx, cy + size) - lumAt(d, w, h, cx, cy - size);
+    return {
+      color: `#${hex2(r / n)}${hex2(g / n)}${hex2(b / n)}`,
+      lum: lumSum / n,
+      mag: Math.min(1, Math.hypot(gx, gy) / 90),
+      ang: Math.atan2(gy, gx) + Math.PI / 2,
+    };
+  };
+  // 落一笔：长度/抖动跟格子走，宽高都盖住格子的对角线，否则会透白底、整片发灰
+  const push = (cx, cy, size, s, wide, alpha) => {
+    const len = size * (1.15 + 0.5 * rnd());
+    const jx = (rnd() - 0.5) * size * 0.4;
+    const jy = (rnd() - 0.5) * size * 0.4;
+    const pts = [];
+    for (let t = -1; t <= 1; t += 1) {
+      pts.push([
+        Math.round(rect.x + cx + jx + Math.cos(s.ang) * (len / 2) * t),
+        Math.round(rect.y + cy + jy + Math.sin(s.ang) * (len / 2) * t),
+      ]);
+    }
+    strokes.push({
+      color: s.color,
+      size: Number((size * (wide + 0.25 * s.mag)).toFixed(2)),
+      opacity: Number((alpha + 0.1 * s.mag).toFixed(2)),
+      points: pts,
+    });
+  };
+
+  // 第一遍：粗铺。网格放大一倍，保证先整幅有颜色，不做成一半空白一半细节
+  const coarse = Math.min(48, Math.max(6, Math.round(step * 2)));
+  for (let cy = coarse / 2; cy < h; cy += coarse) {
+    for (let cx = coarse / 2; cx < w; cx += coarse) {
+      if (strokes.length >= maxStrokes) break;
+      const s = sample(cx, cy, coarse);
+      if (!s) continue;
+      if (s.lum >= minLum) { skippedBg += 1; continue; }
+      cells += 1;
+      push(cx, cy, coarse, s, 1.05, 0.9);
+    }
+    if (strokes.length >= maxStrokes) break;
+  }
+  // 第二遍：细节。只补局部对比强的地方（脸、手、火焰边缘、褶皱），平涂区不再叠
+  const wantDetail = Number(opts.passes) !== 1;
+  if (wantDetail) {
+    for (let cy = step / 2; cy < h; cy += step) {
+      for (let cx = step / 2; cx < w; cx += step) {
+        if (strokes.length >= maxStrokes) break;
+        const s = sample(cx, cy, step);
+        if (!s) continue;
+        if (s.lum >= minLum) continue;
+        if (s.mag < 0.16) continue;
+        cells += 1;
+        push(cx, cy, step, s, 1.15, 0.88);
+      }
+      if (strokes.length >= maxStrokes) break;
+    }
+  }
+  return {
+    strokes,
+    stats: { step, passes: wantDetail ? 2 : 1, coarse, cells, skippedBg, strokes: strokes.length, capped: strokes.length >= maxStrokes },
+  };
+}
+
 function refLayer(doc, wanted) {
   const layers = (doc.layers || []).filter((l) => l.image);
   if (wanted) return layers.find((l) => l.id === wanted || l.name === wanted) || null;
@@ -173,6 +287,7 @@ export async function runHeadless(kind, params, doc, resolve) {
     const widths = pathWidths(inkMask(cut.data, cut.w, cut.h, params.threshold), cut.w, cut.h, t.paths);
     const lineWidth = widths.length ? Number((widths.reduce((a, b) => a + b, 0) / widths.length).toFixed(2)) : null;
     const wantFill = params.style === "flat" || params.style === "anime";
+    const wantPaint = params.style === "paint";
     // 色块必须靠闭合轮廓；中心线模式下的路径是骨架，不闭合，所以填色另跑一遍边界追踪
     let edgeTrace = t;
     if (wantFill && mode === "center") {
@@ -190,9 +305,18 @@ export async function runHeadless(kind, params, doc, resolve) {
     const fills = wantFill
       ? regionFillsFromBitmap(cut, edgeTrace, palette, { minFill: params.minFill, maxFills: params.maxFills || 40, rect })
       : [];
+    const paint = wantPaint
+      ? paintStrokesFromBitmap(cut, rect, palette, {
+        step: params.paintStep,
+        maxStrokes: params.maxStrokes,
+        minLum: params.paintMinLum,
+        passes: params.paintPasses,
+      })
+      : null;
     return {
       ok: true, rect, paths, widths, lineWidth, closed: t.closed, fills, palette, mode,
       smooth: t.smooth, fit: t.fit, inkRatio, lines: t.lines, points: t.points, dropped: t.dropped, headless: true,
+      ...(paint ? { paint: paint.strokes, paintStats: paint.stats } : {}),
     };
   }
   if (kind === "posterize") {
