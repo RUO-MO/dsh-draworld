@@ -1,9 +1,17 @@
 {
   "name": "@xenra/dsh-draworld",
-  "version": "0.1.36",
-  "private": true,
+  "version": "0.1.37",
   "description": "星染世界：DeepSeek Harness 里的一块真画布: a right-sidebar canvas tab plus a paint_canvas tool, so the model and the human draw on the same document.",
   "type": "module",
+  "license": "MIT",
+  "author": "RUO-MO",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/RUO-MO/dsh-draworld.git"
@@ -39,7 +47,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {

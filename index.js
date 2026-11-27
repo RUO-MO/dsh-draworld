@@ -1344,8 +1344,46 @@ export function apply(ctx, config = {}) {
     return state.update;
   };
 
-  const scheduleUpdateCheck = () => {
-    if (state.update.enabled === false) return;
+  /**
+   * 一键更新：git 安装没有版本清单可列，但宿主暴露了 pluginManager（listBundles / updateBundle），
+   * 照 xenra-superagent 的做法按 tag 钉一个 spec 交给它重装，就不用等插件管理器发版。
+   */
+  const applyUpdate = async () => {
+    const info = await checkUpdate();
+    if (!info || !info.latest) throw new Error(info && info.error ? info.error : "没拿到新版本号");
+    const cmp = compareVersion(info.latest, localVersion);
+    if (cmp <= 0) return { upToDate: true, local: localVersion, latest: info.latest };
+    const pm = ctx.get ? ctx.get("pluginManager") : ctx.pluginManager;
+    if (!pm || (typeof pm.updateBundle !== "function" && typeof pm.installBundle !== "function")) {
+      throw new Error("宿主没有暴露 pluginManager（只在 DSH Desktop 里可用）；这条就先去 Release 手动下载安装");
+    }
+    const spec = `git+https://github.com/${UPDATE_REPO}.git#v${info.latest}`;
+    const requestId = `draworld-${Date.now().toString(36)}`;
+    let result = null;
+    let step = null;
+    if (typeof pm.updateBundle === "function") {
+      const out = await pm.updateBundle(name, info.latest, { spec, requestId });
+      step = out && out.step ? out.step : null;
+      result = out && out.result ? out.result : out;
+    } else {
+      result = await pm.installBundle(spec, { enabled: true, saveExact: false });
+    }
+    const application = result && result.application ? result.application : null;
+    const failed = application === "failed" || application === "cancelled";
+    const restartRequired = Boolean(result && result.restartRequired) || application === "restart-required";
+    const message = failed
+      ? `更新到 v${info.latest} 失败（${step || application}）：${JSON.stringify((result && result.error) || null)}`
+      : `已装到 v${info.latest}${restartRequired ? "，重启 DSH 后生效" : ""}`;
+    state.update = {
+      ...state.update,
+      hasUpdate: failed,
+      lastApply: { at: Date.now(), to: info.latest, from: localVersion, application, step, restartRequired, message },
+    };
+    if (failed) throw new Error(message);
+    return { upToDate: false, local: localVersion, latest: info.latest, application, step, restartRequired, message };
+  };
+
+  const scheduleUpdateCheck = () => {    if (state.update.enabled === false) return;
     setTimeout(() => {
       checkUpdate().catch(() => {});
     }, 3000);
@@ -1611,9 +1649,15 @@ export function apply(ctx, config = {}) {
             }
             return;
           }
-          // 主动查一次新版本（界面上点「检查更新」走这里）
+          // 主动查一次新版本（界面上点「检查更新」走这里）；body 里 apply:true 就直接更新
           if (route === "/update" && (req.method === "GET" || req.method === "POST")) {
             try {
+              const body = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
+              if (req.method === "POST" && body.apply) {
+                const applied = await applyUpdate();
+                json(res, 200, { ok: true, local: localVersion, ...state.update, apply: applied });
+                return;
+              }
               const force = url.searchParams.get("force") === "1" || req.method === "POST";
               const result = force ? await checkUpdate() : state.update;
               json(res, 200, { ok: true, local: localVersion, ...result });

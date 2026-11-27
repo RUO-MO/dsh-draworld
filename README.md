@@ -237,7 +237,9 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本�
 - 发布：改完版本 → `git commit` → 打 tag → `gh release create v<version>`，再 `gh release upload <tag> <zip>`（本机 gh 不支持 `--attach`）
 - zip 用 `git archive --format=zip --prefix=dsh-draworld/ -o <zip> <tag>` 生成，仓库 Release 里的 zip 就是可安装的完整插件
 
-**更新提示**：插件自己会查有没有新版本——挂载后 3 秒查一次、之后每 6 小时查一次，画界顶栏出现「有新版本 vX（当前 vY）→ 去 Release 下载」。查版本优先用 `git ls-remote --tags`（不依赖 TLS 信任链，公司网络里 Node 的 fetch 常被中间证书拦掉），git 不可用才退到 GitHub API。不想让它上网：插件配置写 `updateCheck: false`；`pixelTimeout` 可调像素任务等待毫秒（默认 5000）。
+**更新提示**：插件自己会查有没有新版本——挂载后 3 秒查一次、之后每 6 小时查一次，画界顶栏出现「有新版本 vX（当前 vY）」+「一键更新」按钮 +「去 Release 下载」链接。查版本优先用 `git ls-remote --tags`（不依赖 TLS 信任链，公司网络里 Node 的 fetch 常被中间证书拦掉），git 不可用才退到 GitHub API。
+
+「一键更新」走宿主暴露的 `pluginManager`（`ctx.get("pluginManager")`）：按 tag 拼出 `git+https://github.com/RUO-MO/dsh-draworld.git#vX`，交给 `updateBundle` 重装，和 git 安装的插件自己更新的方式一样。所以 git 地址装的也能收到更新，不需要等 npm 发版；宿主没暴露 `pluginManager`（非 DSH Desktop）时按钮会直说「这条就先去 Release 手动下载安装」。更新完成后一般要重启 DSH 才生效，页面会提示。不想让它上网：插件配置写 `updateCheck: false`；`pixelTimeout` 可调像素任务等待毫秒（默认 5000）。
 
 ## 已知限制
 

@@ -165,6 +165,10 @@ window.__ModuleLoader__.load({
         updateTip: '有新版本',
         updateNow: '当前',
         updateGo: '去 Release 下载',
+        updateApply: '一键更新',
+        updateApplying: '更新中…',
+        updateDone: '已触发更新，重启 DSH 后生效',
+        updateFail: '更新没成',
         zoomFit: '适应',
         zoomActual: '1:1',
         panHint: '空格拖动/中键拖动平移，滚轮缩放',
@@ -300,6 +304,10 @@ window.__ModuleLoader__.load({
         updateTip: 'Update available',
         updateNow: 'now',
         updateGo: 'Get it on Releases',
+        updateApply: 'Update now',
+        updateApplying: 'Updating…',
+        updateDone: 'Update triggered: restart DSH to apply',
+        updateFail: 'Update failed',
         zoomFit: 'Fit',
         zoomActual: '1:1',
         panHint: 'Space or middle-drag to pan, wheel to zoom',
@@ -2484,6 +2492,35 @@ window.__ModuleLoader__.load({
       const [playing, setPlaying] = React.useState(false);
       /** 宿主查到的版本信息：有新版本时在标题旁边挂一枚提示。 */
       const [updateInfo, setUpdateInfo] = React.useState(null);
+      const [applying, setApplying] = React.useState(false);
+      const [applyNote, setApplyNote] = React.useState('');
+
+      /** 一键更新：宿主拿 pluginManager 按 tag 重装（git 安装也能收更新）。 */
+      const applyUpdate = async () => {
+        if (applying) return;
+        setApplying(true);
+        setApplyNote('');
+        try {
+          const r = await fetch(`${API}/update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apply: true }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok || body.ok === false) {
+            setApplyNote(`${t('updateFail')}：${body.error || r.status}`);
+            return;
+          }
+          const done = body.apply && body.apply.message ? body.apply.message : t('updateDone');
+          setApplyNote(done);
+          if (body.apply && body.apply.upToDate) setUpdateInfo({ ...(body || {}), hasUpdate: false });
+        } catch (err) {
+          // 更新会触发重载/重启，请求可能被掐断，这不算失败
+          setApplyNote(t('updateDone'));
+        } finally {
+          setApplying(false);
+        }
+      };
       const [meta, setMeta] = React.useState({ strokes: 0, redo: 0, layers: [], activeLayer: null, background: '#ffffff', width: 1024, height: 1024 });
       const viewportRef = React.useRef(null);
       const viewRef = React.useRef({ scale: 1, x: 0, y: 0 });
@@ -3546,12 +3583,29 @@ window.__ModuleLoader__.load({
                   display: 'flex',
                   gap: 8,
                   alignItems: 'center',
+                  flexWrap: 'wrap',
                   color: 'var(--dsw-alias-label-secondary, inherit)',
                   background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.1))',
                   border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
                 },
               },
                 h('span', null, `${t('updateTip')} ${updateInfo.latest}${updateInfo.local ? `（${t('updateNow')} ${updateInfo.local}）` : ''}`),
+                h('button', {
+                  type: 'button',
+                  onClick: applyUpdate,
+                  disabled: applying,
+                  style: {
+                    padding: '2px 8px',
+                    borderRadius: 6,
+                    border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.3))',
+                    background: 'var(--dsw-alias-brand-primary, #4d6bfe)',
+                    color: '#fff',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    cursor: applying ? 'default' : 'pointer',
+                    opacity: applying ? 0.7 : 1,
+                  },
+                }, applying ? t('updateApplying') : t('updateApply')),
                 updateInfo.url
                   ? h('a', {
                     href: updateInfo.url,
@@ -3559,6 +3613,9 @@ window.__ModuleLoader__.load({
                     rel: 'noreferrer',
                     style: { color: 'var(--dsw-alias-brand-primary, inherit)', fontWeight: 600 },
                   }, t('updateGo'))
+                  : null,
+                applyNote
+                  ? h('span', { style: { opacity: 0.8 } }, applyNote)
                   : null)
               : null,
             h('div', {
