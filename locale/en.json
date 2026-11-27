@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Draworld",
+    "description": "One shared canvas in the right sidebar: strokes are data, so they undo cleanly and stay editable"
+  }
+}
