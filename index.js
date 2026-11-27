@@ -1224,7 +1224,7 @@ export function apply(ctx, config = {}) {
   const PIXEL_TIMEOUT_MS = Math.max(1500, Number(config.pixelTimeout || 5000));
   // 整幅（1080×1440 这种）做骨架细化+折线拼接是重活，5 秒根本不够：
   // 给这几类单独一档超时，默认 30 秒，可用 heavyTimeout 调。
-  const HEAVY_KINDS = new Set(["trace", "copy", "fill", "compare", "palette"]);
+  const HEAVY_KINDS = new Set(["trace", "copy", "posterize", "fill", "compare", "palette"]);
   const HEAVY_TIMEOUT_MS = Math.max(PIXEL_TIMEOUT_MS, Number(config.heavyTimeout || 30000));
   const timeoutFor = (kind) => (HEAVY_KINDS.has(kind) ? HEAVY_TIMEOUT_MS : PIXEL_TIMEOUT_MS);
   const jobs = new Map();
@@ -1233,7 +1233,7 @@ export function apply(ctx, config = {}) {
 
   // 面板在不在：前端每 700ms 轮询一次 /jobs，2.5 秒没动静就当作没有面板 → 宿主机自己算
   const panelLive = () => Date.now() - (state.panelAt || 0) < 2500;
-  const HEADLESS_KINDS = new Set(["crop", "ref", "pick", "palette", "trace", "copy", "fill", "compare"]);
+  const HEADLESS_KINDS = new Set(["crop", "ref", "pick", "palette", "trace", "copy", "posterize", "fill", "compare"]);
 
   const runHeadlessPixel = async (kind, params) => {
     try {
@@ -2035,15 +2035,17 @@ export function apply(ctx, config = {}) {
       "view 取最新渲染结果（rect 裁切、zoom 放大、layer 只看单层，并给每层的包围盒与覆盖率）；" +
       "ref 把参考图（或它的一块裁切）导出成 PNG，用 read_image 直接看；pick 读某点的颜色/透明度；" +
       "compare 出「当前画面 vs 参考图」的差分图和数值；palette 提参考图主色；" +
+      "copy 按阈值描线复刻（线稿/平涂/两者）；posterize 把彩图按色阶分区复刻成可编辑色块（可顺带描边界线稿），彩稿用这个而不是 copy；" +
       "snapshot / restore 整幅存档与回退；undo / redo 撤销重做；clear 清空（给 layer 只清那层）；" +
       "layer 增删改图层（name/visible/layerOpacity/blend/locked）；" +
-      "import 把本机图片导入成最底下的图片层（path 或 dataUrl）；canvas 改画布尺寸和背景；export 把当前渲染另存成 PNG。",
+      "import 把本机图片导入成最底下的图片层（path 或 dataUrl）；canvas 改画布尺寸和背景；" +
+      "export 把当前渲染另存成 PNG（面板没开时宿主自己光栅化，不依赖前端回传）。",
     parameters: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["doc", "copy", "fix", "fill", "draw", "view", "ref", "trace", "pick", "compare", "palette", "select", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
+          enum: ["doc", "copy", "posterize", "fix", "fill", "draw", "view", "ref", "trace", "pick", "compare", "palette", "select", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
           description: "要执行的动作。new 是另起一幅（可先保存当前、也可用图片建画布）。",
         },
         points: {
@@ -2074,6 +2076,11 @@ export function apply(ctx, config = {}) {
             + "特效 halftone 漫画网点 / glow 光效 / sparkle 粒子。默认 round。",
         },
         taper: { type: "boolean", description: "draw: 起收笔渐细（手绘感），默认 false。" },
+        widths: {
+          type: "boolean",
+          description: "trace: 回一份 pathsWidth（每个点带第 3 个压力值），配合 size=sizeHint、minSize=0 让笔迹按原图局部线宽变粗变细。",
+        },
+        sizeHint: { type: "number", description: "trace widths=true 时返回的建议笔刷 size（≈ 原图 p90 线宽）。" },
         minSize: {
           type: "number",
           description: "draw: 最小笔宽占 size 的比例 0..1，默认 0.3；压力最轻时也不会细成一条线。",
@@ -2107,11 +2114,6 @@ export function apply(ctx, config = {}) {
           description: "import: 本机图片的绝对路径（PNG/JPEG/WebP/GIF）。",
         },
         dataUrl: { type: "string", description: "import: 图片 dataURL，和 path 二选一。" },
-        fit: {
-          type: "string",
-          enum: ["contain", "cover", "stretch"],
-          description: "import: 落位方式，默认 contain（整张居中放进画布）。",
-        },
         width: { type: "number", description: "canvas: 新宽度 16~4096。" },
         height: { type: "number", description: "canvas: 新高度 16~4096。" },
         background: { type: "string", description: "canvas: 背景色 #rrggbb。" },
@@ -2156,7 +2158,21 @@ export function apply(ctx, config = {}) {
           description: "trace: 折线简化容差（像素），默认 2.5。大一点更概括，小一点更贴边。",
         },
         minLength: { type: "number", description: "trace: 丢掉的短线段长度下限（像素），默认 12（copy 默认 16），用来滤掉噪点。" },
-        maxLines: { type: "number", description: "trace: 最多返回几条折线，默认 80。" },
+        maxLines: { type: "number", description: "trace / posterize: 最多返回几条折线，trace 默认 80，posterize 描边界时默认 1600。" },
+        minArea: {
+          type: "number",
+          description: "posterize: 小于多少像素的色块丢掉，默认画布面积/4000（1080×1440 约 389）。小一点细节多但笔迹暴增。",
+        },
+        maxFills: { type: "number", description: "posterize: 最多铺几块色，默认 3000。" },
+        lines: {
+          type: "boolean",
+          description: "posterize: 顺手把色块之间的边界描成线稿层（默认 false，只要色块）。",
+        },
+        placement: {
+          type: "string",
+          enum: ["contain", "cover", "stretch"],
+          description: "import: 落位方式，默认 contain（整张居中放进画布）。",
+        },
         smooth: {
           type: "number",
           description: "trace / copy: 描线后磨圆几遍 0~3，默认 trace 1、copy 2。觉得线还是抖就给 3；要贴原图硬边就给 0。",
@@ -2171,7 +2187,7 @@ export function apply(ctx, config = {}) {
           enum: ["lineart", "flat", "anime"],
           description: "copy: 复刻风格。lineart 只出线稿；flat 只出区域色块；anime 出线稿+色块（默认）。",
         },
-        colors: { type: "number", description: "copy / palette: 主色档数 2~8，默认 6。" },
+        colors: { type: "number", description: "copy / posterize / palette: 主色档数 2~12（copy 默认 6，posterize 默认 8）。彩稿要火、金、肤这些颜色都出来，给 10~12。" },
         minFill: { type: "number", description: "copy: 小于多少像素的闭合区域不填色，默认 320。" },
         target: { type: "number", description: "fix: 目标覆盖率百分比，默认 90。到了就停。" },
         maxRounds: { type: "number", description: "fix: 最多迭代几轮，默认 3（上限 5）。" },
@@ -2189,7 +2205,7 @@ export function apply(ctx, config = {}) {
           type: "boolean",
           description: "select: 清掉选区，恢复整幅可画。",
         },
-        k: { type: "number", description: "palette: 要几档主色，默认 6（上限 8）。" },
+        k: { type: "number", description: "palette: 要几档主色，默认 6（上限 12）。" },
         snapshotId: { type: "string", description: "restore: 回退到哪一版快照（snapshot 返回的 id）；不给回最近一版。" },
         label: { type: "string", description: "snapshot: 这版备注，比如「上色前」。" },
         locked: { type: "boolean", description: "layer.set：锁定这层（参考图锁住，模型就盖不上去，也不会被误擦）。" },
@@ -2370,7 +2386,7 @@ export function apply(ctx, config = {}) {
             const result = docs.importImage({
               buffer,
               name: args.name || fallbackName,
-              fit: args.fit,
+              fit: args.placement || (typeof args.fit === "string" ? args.fit : undefined),
               opacity: args.layerOpacity,
             });
             return {
@@ -2394,20 +2410,46 @@ export function apply(ctx, config = {}) {
             };
           }
           case "export": {
-            const source = args.transparent ? docs.previewAlpha : docs.preview;
-            if (!existsSync(source)) {
-              throw new Error(args.transparent
-                ? "还没有透明底渲染：先在界面里打开画界，等前端回传一帧"
-                : "还没有渲染结果：先在界面里打开画界画一笔，前端会把渲染回传");
-            }
             const now = new Date();
             const pad = (n) => String(n).padStart(2, "0");
             const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
             const saveDir = paths.saveDir();
             mkdirSync(saveDir, { recursive: true });
-            const target = path.join(saveDir, `画界-${stamp}${args.transparent ? "-alpha" : ""}.png`);
-            copyFileSync(source, target);
-            return { ok: true, path: target, saveDir, transparent: Boolean(args.transparent) };
+            const target = args.path
+              ? path.resolve(String(args.path))
+              : path.join(saveDir, `画界-${stamp}${args.transparent ? "-alpha" : ""}.png`);
+            const source = args.transparent ? docs.previewAlpha : docs.preview;
+            if (existsSync(source) && !args.path) {
+              copyFileSync(source, target);
+              return { ok: true, path: target, saveDir, transparent: Boolean(args.transparent), rendered: "panel" };
+            }
+            // 面板没开、没有前端帧：宿主自己光栅化（0.1.40 起），不开界面也能导出/验收
+            try {
+              const mod = await import("./pixels.js");
+              const docSurf = await mod.rasterDoc(docs.doc, { resolve: (f) => path.resolve(dir, f) });
+              let out = docSurf;
+              if (!args.transparent) {
+                const hex = String(docs.doc.background || "#ffffff").replace("#", "");
+                const rgb = [0, 1, 2].map((k) => {
+                  const v = parseInt(hex.slice(k * 2, k * 2 + 2), 16);
+                  return Number.isFinite(v) ? v : 255;
+                });
+                const bg = mod.makeSurface(docSurf.w, docSurf.h);
+                for (let i = 0; i < bg.data.length; i += 4) {
+                  bg.data[i] = rgb[0];
+                  bg.data[i + 1] = rgb[1];
+                  bg.data[i + 2] = rgb[2];
+                  bg.data[i + 3] = 255;
+                }
+                mod.blitImage(bg, { data: docSurf.data, width: docSurf.w, height: docSurf.h }, 0, 0, docSurf.w, docSurf.h);
+                out = bg;
+              }
+              mkdirSync(path.dirname(target), { recursive: true });
+              writeFileSync(target, mod.encodePng(out.data, out.w, out.h));
+              return { ok: true, path: target, saveDir, transparent: Boolean(args.transparent), rendered: "host" };
+            } catch (err) {
+              throw new Error(`没有前端渲染帧，宿主侧光栅化也没成：${(err && err.message) || err}`);
+            }
           }
           case "undo":
             docs.undo(Math.max(1, Math.round(Number(args.count) || 1)));
@@ -2670,6 +2712,62 @@ export function apply(ctx, config = {}) {
                 + "想补差距就 action=fix。",
             };
           }
+          case "posterize": {
+            // 彩图复刻成图：按色阶分区，每块是一个可编辑填色（不是黑线），
+            // 需要线稿再 lines=true 描色块边界。
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const job = await runPixelJob("posterize", {
+              rect,
+              layer: args.refLayer === undefined ? null : args.refLayer,
+              colors: args.colors,
+              minArea: args.minArea,
+              tolerance: args.tolerance,
+              maxFills: args.maxFills,
+              lines: args.lines === true,
+              minLength: args.minLength,
+              maxLines: args.maxLines,
+            }, PIXEL_TIMEOUT_MS * 3);
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            const created = [];
+            const pickLayer = (name) => {
+              const want = String(name || "").trim();
+              const found = want ? docs.layer(want) : null;
+              if (found && !found.locked && !found.image && (found.strokes || []).length === 0) return found;
+              return docs.addLayer(want || undefined);
+            };
+            if (Array.isArray(job.fills) && job.fills.length > 0) {
+              const layer = pickLayer(args.fillLayer || "色块");
+              docs.append(
+                job.fills.map((f) => ({ mode: "fill", color: f.color, size: 1, opacity: 1, points: f.points, holes: f.holes || [] })),
+                layer.id,
+              );
+              created.push({ name: layer.name, kind: "fill", items: job.fills.length });
+            }
+            if (Array.isArray(job.paths) && job.paths.length > 0) {
+              const layer = pickLayer(args.layer || "线稿");
+              const color = args.color || "#111111";
+              const brush = BRUSH_IDS.includes(args.brush) ? args.brush : "liner";
+              const base = Math.max(1, Number(args.size) || 2);
+              docs.append(
+                job.paths.filter((p) => p && p.length >= 2).map((points) => ({ color, size: base, brush, opacity: 1, points })),
+                layer.id,
+              );
+              created.push({ name: layer.name, kind: "line", items: job.paths.length });
+            }
+            const cmp = await runPixelJob("compare", { rect }, PIXEL_TIMEOUT_MS * 2);
+            return {
+              ok: true,
+              revision: docs.revision,
+              rect,
+              created,
+              palette: job.stats && job.stats.palette,
+              stats: job.stats,
+              metrics: cmp.ok ? cmp.metrics : null,
+              hint: `已按 ${job.stats ? job.stats.colorCount : "?"} 色阶分区复刻：${created.map((c) => `${c.name}(${c.items})`).join(" + ") || "没有可画的内容"}。`
+                + (cmp.ok ? `覆盖率 ${cmp.metrics.coveragePct}%，多画 ${cmp.metrics.extraPct}%，色差 ${cmp.metrics.meanColorDiff}。` : "")
+                + "要更像原图就调 colors（色阶数）/ minArea（细节门槛），或者 lines=true 补边界线稿。",
+            };
+          }
           case "fix": {
             const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
             const maxRounds = Math.max(1, Math.min(5, Math.round(Number(args.maxRounds) || 3)));
@@ -2746,6 +2844,7 @@ export function apply(ctx, config = {}) {
               smooth: args.smooth,
               fit: args.fit === true,
               fitStep: args.fitStep,
+              widths: args.widths === true,
               mode: args.mode === "center" ? "center" : "edge",
             });
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
@@ -2762,7 +2861,11 @@ export function apply(ctx, config = {}) {
               fit: job.fit === undefined ? null : job.fit,
               paths: job.paths,
               stats: job.stats,
+              ...(job.pathsWidth ? { pathsWidth: job.pathsWidth, sizeHint: job.sizeHint } : {}),
               hint: "paths 是从参考图抽出的轮廓折线（画布坐标），每段直接当 draw 的 points 用；长图可分批 batches=[…]。"
+                + (job.pathsWidth
+                  ? ` width=true 时用 pathsWidth（点带第 3 个压力值，sizeHint=${job.sizeHint}）：draw 时 size=sizeHint、minSize=0，笔迹就会按原图局部线宽自己变粗变细。`
+                  : " 想要粗细跟着原图走，加 widths=true，会多回一份带逐点压力的 pathsWidth。")
                 + "stats 给的是 inkRatio/widthAvg/widthMin/widthMax/droppedPct，调 threshold/tolerance/fitStep 时看这几个数，不用只靠肉眼。"
                 + "描完用 view rect+zoom 对照，再用 compare 看 coveragePct。",
             };

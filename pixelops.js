@@ -6,7 +6,7 @@ import path from "node:path";
 import {
   loadImage, inkMask, blurMask, marchingSquares, stitchSegments, rdp, traceInk,
   kmeansColors, polygonArea, pointInPolygon, pathWidths, rasterDoc, cropSurface, zoomSurface,
-  encodePng, makeSurface, toHex,
+  encodePng, makeSurface, toHex, inkDistance, pathPointWidths, posterizeFills,
 } from "./pixels.js";
 
 const dataUrlOf = (surf) => `data:image/png;base64,${encodePng(surf.data, surf.w, surf.h).toString("base64")}`;
@@ -121,9 +121,31 @@ export async function runHeadless(kind, params, doc, resolve) {
       pointsPerLine: t.lines ? Number((t.points / t.lines).toFixed(1)) : null,
       droppedPct: t.lines + t.dropped > 0 ? Number((t.dropped / (t.lines + t.dropped) * 100).toFixed(1)) : null,
     };
+
+    // widths=true：折线带上逐点压力（第 3 个数），让笔迹自己长成原图的粗细，
+    // 而不是一条从头到尾同宽的「硬线」。pressure = 局部线宽 / p90 线宽，配合 size=sizeHint、minSize=0 用。
+    let pathsWidth = null;
+    let sizeHint = null;
+    if (params.widths) {
+      const dist = inkDistance(mask, cut.w, cut.h);
+      const perPath = t.paths.map((line) => pathPointWidths(mask, cut.w, cut.h, line, dist));
+      const all = perPath.reduce((acc, arr) => acc.concat(arr), []);
+      all.sort((a, b) => a - b);
+      const p90 = all.length ? all[Math.floor(all.length * 0.9)] : 1;
+      sizeHint = Math.max(2, Math.round(p90));
+      pathsWidth = t.paths.map((line, li) => line.map((p, k) => [
+        Math.round(rect.x + p[0]),
+        Math.round(rect.y + p[1]),
+        Number(Math.min(1, Math.max(0.05, perPath[li][k] / sizeHint)).toFixed(3)),
+      ]));
+      stats.sizeHint = sizeHint;
+      stats.widthP90 = Number(p90.toFixed(2));
+    }
+
     return {
       ok: true, rect, paths, lines: t.lines, points: t.points, dropped: t.dropped,
       tolerance: t.tolerance, smooth: t.smooth, fit: t.fit, mode: t.mode, headless: true, stats,
+      ...(pathsWidth ? { pathsWidth, sizeHint } : {}),
     };
   }
   if (kind === "copy") {
@@ -172,6 +194,24 @@ export async function runHeadless(kind, params, doc, resolve) {
       ok: true, rect, paths, widths, lineWidth, closed: t.closed, fills, palette, mode,
       smooth: t.smooth, fit: t.fit, inkRatio, lines: t.lines, points: t.points, dropped: t.dropped, headless: true,
     };
+  }
+  if (kind === "posterize") {
+    const surf = await refSurface(doc, resolve, params);
+    const rect = clampRect(params.rect, surf.w, surf.h);
+    const cut = cropSurface(surf, rect);
+    const res = posterizeFills(cut.data, cut.w, cut.h, {
+      colors: params.colors,
+      minArea: params.minArea,
+      tolerance: params.tolerance,
+      maxFills: params.maxFills,
+      lines: params.lines === true,
+      minLength: params.minLength,
+      maxLines: params.maxLines,
+    });
+    const shift = (pts) => pts.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]);
+    const fills = res.fills.map((f) => ({ color: f.color, points: shift(f.points), holes: (f.holes || []).map(shift), area: f.area }));
+    const paths = res.paths.map(shift);
+    return { ok: true, rect, fills, paths, stats: res.stats, headless: true };
   }
   if (kind === "fill") {
     const sx = Math.round(Number(params.x));

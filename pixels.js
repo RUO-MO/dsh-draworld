@@ -647,6 +647,57 @@ export function pathWidths(mask, w, h, paths) {
   });
 }
 
+/** 墨迹到背景的 chamfer 距离（两遍扫描，8 邻域 1 / 1.414）。返回值 ×2 就是局部线宽。 */
+export function inkDistance(mask, w, h) {
+  const INF = 1e9;
+  const d = new Float32Array(w * h);
+  for (let i = 0; i < d.length; i += 1) d[i] = mask[i] ? INF : 0;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = y * w + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x > 0) v = Math.min(v, d[i - 1] + 1);
+      if (y > 0) {
+        if (x > 0) v = Math.min(v, d[i - w - 1] + 1.414);
+        v = Math.min(v, d[i - w] + 1);
+        if (x + 1 < w) v = Math.min(v, d[i - w + 1] + 1.414);
+      }
+      d[i] = v;
+    }
+  }
+  for (let y = h - 1; y >= 0; y -= 1) {
+    for (let x = w - 1; x >= 0; x -= 1) {
+      const i = y * w + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x + 1 < w) v = Math.min(v, d[i + 1] + 1);
+      if (y + 1 < h) {
+        if (x + 1 < w) v = Math.min(v, d[i + w + 1] + 1.414);
+        v = Math.min(v, d[i + w] + 1);
+        if (x > 0) v = Math.min(v, d[i + w - 1] + 1.414);
+      }
+      d[i] = v;
+    }
+  }
+  return d;
+}
+
+/** 折线上每个点的局部线宽（像素）；没给距离图就现算一张。 */
+export function pathPointWidths(mask, w, h, path, dist, cap = 0) {
+  const d = dist || inkDistance(mask, w, h);
+  const out = new Array(path.length);
+  for (let k = 0; k < path.length; k += 1) {
+    const p = path[k];
+    const x = Math.max(0, Math.min(w - 1, Math.round(p[0])));
+    const y = Math.max(0, Math.min(h - 1, Math.round(p[1])));
+    let v = 2 * d[y * w + x];
+    if (cap > 0) v = Math.min(v, cap);
+    out[k] = Number(Math.max(1, v).toFixed(2));
+  }
+  return out;
+}
+
 export function kmeansColors(data, k, stepPx = 2) {
   const samples = [];
   for (let i = 0; i < data.length; i += 4 * stepPx) {
@@ -654,7 +705,7 @@ export function kmeansColors(data, k, stepPx = 2) {
     samples.push([data[i], data[i + 1], data[i + 2]]);
   }
   if (samples.length === 0) throw new Error("这块区域里没有不透明的像素");
-  const kk = Math.max(2, Math.min(8, Math.round(k)));
+  const kk = Math.max(2, Math.min(12, Math.round(k)));
   const buckets = new Map();
   for (const s of samples) {
     const key = ((s[0] >> 3) << 10) | ((s[1] >> 3) << 5) | (s[2] >> 3);
@@ -698,6 +749,171 @@ export function kmeansColors(data, k, stepPx = 2) {
 export function toHex(r, g, b) {
   const h = (v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0");
   return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+function signedArea(pts) {
+  let a = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i, i += 1) {
+    a += pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1];
+  }
+  return a / 2;
+}
+
+function bboxOf(pts) {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const p of pts) {
+    if (p[0] < x0) x0 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] > y1) y1 = p[1];
+  }
+  return { x0, y0, x1, y1 };
+}
+
+/**
+ * 彩图 → 按色阶分区填色（posterize）。比阈值描线适合彩稿：
+ * 先把整幅图量化成 k 色，每一色的连通区按轮廓各自成一块可编辑填色，
+ * 大块先铺、小块压在上面，孔洞挂到外层多边形上当 holes。
+ * opts.lines=true 时再把色块之间的边界trace成线稿。
+ */
+export function posterizeFills(imageData, w, h, opts = {}) {
+  const k = Math.max(2, Math.min(12, Math.round(Number(opts.colors) || 8)));
+  const minArea = Math.max(4, Number(opts.minArea) || Math.round((w * h) / 4000));
+  const tolerance = Math.max(0.5, Number(opts.tolerance) || 1.2);
+  const maxFills = Math.max(1, Number(opts.maxFills) || 1600);
+  const thinKeep = Math.max(0, Number(opts.thinKeep) || 30);
+  const palette = kmeansColors(imageData, k, Math.max(1, Math.round(Number(opts.sampleStep) || 3)));
+  const pal = palette.map((p) => p.rgb);
+  const idx = new Uint8Array(w * h).fill(255);
+  for (let p = 0; p < w * h; p += 1) {
+    const i = p * 4;
+    if (imageData[i + 3] < 16) continue;
+    let best = 0;
+    let bd = Infinity;
+    for (let c = 0; c < pal.length; c += 1) {
+      const d = (imageData[i] - pal[c][0]) ** 2 + (imageData[i + 1] - pal[c][1]) ** 2 + (imageData[i + 2] - pal[c][2]) ** 2;
+      if (d < bd) {
+        bd = d;
+        best = c;
+      }
+    }
+    idx[p] = best;
+  }
+  // 色阶图先做一遍众数滤波：把彩稿里的渐变噪点和零星小岛抹掉，
+  // 不然轮廓会碎成一地碎屑，线稿层也跟着炸。
+  const passes = Math.max(0, Math.min(3, opts.denoise === undefined ? 1 : Number(opts.denoise) || 0));
+  for (let pass = 0; pass < passes; pass += 1) {
+    const out = Uint8Array.from(idx);
+    const counts = new Uint16Array(pal.length + 1);
+    for (let y = 1; y < h - 1; y += 1) {
+      for (let x = 1; x < w - 1; x += 1) {
+        const p = y * w + x;
+        if (idx[p] === 255) continue;
+        counts.fill(0);
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            const q = idx[p + dy * w + dx];
+            if (q !== 255) counts[q] += 1;
+          }
+        }
+        let best = idx[p];
+        let bc = counts[best];
+        for (let c = 0; c < pal.length; c += 1) {
+          if (counts[c] > bc) {
+            bc = counts[c];
+            best = c;
+          }
+        }
+        out[p] = best;
+      }
+    }
+    idx.set(out);
+  }
+  // 相邻像素属于不同色阶的地方，就是色块边界（后面可选地描成线稿）
+  const edge = new Uint8Array(w * h);
+  let edgePixels = 0;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const p = y * w + x;
+      const v = idx[p];
+      if (v === 255) continue;
+      if ((x + 1 < w && idx[p + 1] !== 255 && idx[p + 1] !== v) || (y + 1 < h && idx[p + w] !== 255 && idx[p + w] !== v)) {
+        edge[p] = 1;
+        edgePixels += 1;
+      }
+    }
+  }
+  const rings = [];
+  for (let c = 0; c < pal.length; c += 1) {
+    const mask = new Uint8Array(w * h);
+    let area = 0;
+    for (let p = 0; p < w * h; p += 1) {
+      if (idx[p] === c) {
+        mask[p] = 1;
+        area += 1;
+      }
+    }
+    if (area < minArea) continue;
+    for (const raw of stitchSegments(marchingSquares(mask, w, h))) {
+      const pts = raw.map((p) => [p[0] / 2, p[1] / 2]);
+      if (pts.length < 4) continue;
+      if (Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) > 2) continue;
+      pts.pop();
+      const sa = signedArea(pts);
+      const bb = bboxOf(pts);
+      const span = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0);
+      // 细长条（衣褶高光、发丝边）面积小但很长，一律扔掉会在交界处留白缝，
+      // 所以面积不够但跨度够的也留着。
+      if (Math.abs(sa) < minArea && span < thinKeep) continue;
+      const simplified = rdp(pts, tolerance).map((p) => [
+        Number(Math.max(0, Math.min(w - 1, p[0])).toFixed(1)),
+        Number(Math.max(0, Math.min(h - 1, p[1])).toFixed(1)),
+      ]);
+      if (simplified.length < 3) continue;
+      rings.push({ color: palette[c].hex, c, pts: simplified, area: Math.abs(sa), sign: Math.sign(sa), bbox: bboxOf(simplified), holes: [] });
+    }
+  }
+  // 正反两种环都当成独立色块，按面积从大到小铺：大块先垫底，小块压上去。
+  // 不把反向环当 holes 扣掉——扣掉会在彩色交界处留出一圈白缝，肉眼就是「没画满」。
+  const fills = rings
+    .sort((a, b) => b.area - a.area)
+    .slice(0, maxFills)
+    .map((r) => ({ color: r.color, points: r.pts, holes: [], area: Math.round(r.area) }));
+  const stats = {
+    colorCount: pal.length,
+    palette: palette.map((p) => p.hex),
+    fills: fills.length,
+    fillPixels: fills.reduce((n, f) => n + f.area, 0),
+    coveragePct: Number(((fills.reduce((n, f) => n + f.area, 0) / (w * h)) * 100).toFixed(1)),
+    edgePixels,
+  };
+  let lines = { paths: [], widths: [] };
+  if (opts.lines === true) {
+    const ink = new Uint8Array(w * h * 4);
+    for (let p = 0; p < w * h; p += 1) {
+      const i = p * 4;
+      const on = edge[p] === 1;
+      ink[i] = on ? 0 : 255;
+      ink[i + 1] = on ? 0 : 255;
+      ink[i + 2] = on ? 0 : 255;
+      ink[i + 3] = 255;
+    }
+    lines = traceInk(ink, w, h, {
+      threshold: 0.4,
+      minLength: Number(opts.minLength) || 24,
+      maxLines: Math.max(1, Number(opts.maxLines) || 900),
+      tolerance: Number(opts.lineTolerance) || 1.4,
+      smooth: 1,
+      fit: false,
+    });
+    stats.lineCount = lines.lines;
+    stats.linePoints = lines.points;
+    stats.lineColors = pal.length;
+  }
+  return { fills, stats, paths: lines.paths || [], widths: lines.widths || [] };
 }
 
 /** 参考图 → 折线（和前端 traceInk 同一套参数）。 */

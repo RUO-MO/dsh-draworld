@@ -1046,6 +1046,54 @@ window.__ModuleLoader__.load({
       g.restore();
     }
 
+    /**
+     * 只有「最上面那层追加了普通笔迹」时，直接在现有画布上补画，不整幅重绘。
+     * 模型一批批落笔时，面板因此是「一笔笔长出来」，而不是每 700ms 跳一张新图。
+     * 返回 false 表示这次变动不适合增量，交给 renderDoc 全量画。
+     */
+    function paintAppended(canvas, prevDoc, nextDoc) {
+      if (!canvas || !prevDoc || !nextDoc) return false;
+      if (prevDoc.width !== nextDoc.width || prevDoc.height !== nextDoc.height) return false;
+      const a = layersOf(prevDoc);
+      const b = layersOf(nextDoc);
+      if (a.length !== b.length) return false;
+      let changed = -1;
+      let added = 0;
+      for (let i = 0; i < b.length; i += 1) {
+        const pa = a[i];
+        const pb = b[i];
+        if (pa.id !== pb.id) return false;
+        if (pa.visible !== pb.visible) return false;
+        if ((pa.opacity === undefined ? 1 : Number(pa.opacity)) !== (pb.opacity === undefined ? 1 : Number(pb.opacity))) return false;
+        if ((pa.blend || 'normal') !== (pb.blend || 'normal')) return false;
+        if (Boolean(pa.image && pa.image.file) !== Boolean(pb.image && pb.image.file)) return false;
+        const na = (pa.strokes || []).length;
+        const nb = (pb.strokes || []).length;
+        if (nb < na) return false;
+        if (nb > na) {
+          if (changed >= 0) return false;
+          changed = i;
+          added = nb - na;
+        }
+      }
+      if (changed < 0 || added === 0) return false;
+      const layer = b[changed];
+      if (layer.visible === false) return true; // 看不见的层加了笔，画面本来就不用变
+      if (changed !== b.length - 1) return false; // 不是最上层，叠上去会盖住上面
+      if ((layer.opacity === undefined ? 1 : Number(layer.opacity)) !== 1) return false;
+      if (layer.blend === 'multiply') return false;
+      const fresh = (layer.strokes || []).slice((a[changed].strokes || []).length);
+      if (fresh.some((s) => s.mode === 'eraser')) return false;
+      const g = canvas.getContext('2d');
+      if (!g) return false;
+      g.save();
+      g.globalCompositeOperation = 'source-over';
+      g.globalAlpha = 1;
+      for (const s of fresh) paintStroke(g, s);
+      g.restore();
+      return true;
+    }
+
     /** 造一块离屏画布。 */
     function surface(w, h) {
       const c = document.createElement('canvas');
@@ -2790,14 +2838,18 @@ window.__ModuleLoader__.load({
             setStaleHost(!(Number(body.brushes) >= BRUSHES.length));
             setUpdateInfo(body.update || null);
             if (body.version) setLocalVer(String(body.version));
+            const prevDoc = docRef.current;
+            const prevRev = revRef.current;
             docRef.current = body.doc;
             await ensureImages(body.doc);
             if (!alive) return;
-            if (body.revision !== revRef.current) {
+            if (body.revision !== prevRev) {
               revRef.current = body.revision;
               setRevision(body.revision);
               readMeta(body.doc);
-              renderDoc(canvasRef.current, body.doc);
+              if (!paintAppended(canvasRef.current, prevDoc, body.doc)) {
+                renderDoc(canvasRef.current, body.doc);
+              }
               setTimeout(uploadPreview, 300);
               // 第一次拿到文档、或画布尺寸变了，重新适应窗口
               const fit = fitDimsRef.current;
@@ -2810,7 +2862,7 @@ window.__ModuleLoader__.load({
           } catch {
             if (alive) setError(t('syncFailed'));
           } finally {
-            if (alive) timer = setTimeout(tick, 700);
+            if (alive) timer = setTimeout(tick, 500);
           }
         };
         tick();

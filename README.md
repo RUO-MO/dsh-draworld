@@ -166,6 +166,7 @@ https://github.com/RUO-MO/dsh-draworld
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
 | `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`）；描线默认做**三次贝塞尔拟合**（`fit=false` 退回磨圆 `smooth=0~3`）；每根线按量出来的**原线宽**落笔，`splitLines=true` 再把粗细分到「线稿 / 粗线」两层 |
+| `posterize` | **彩图复刻成图（0.1.40 起）**：先 k-means 量化成 `colors` 档（2~12，默认 8），再把每一色的连通区按 marching squares 轮廓各自落成一块可编辑填色（大块先垫、小块压上；细长条不过滤，避免交界白缝），建「色块」层；`lines=true` 顺手把色块边界描成「线稿」层。**彩稿用这个，别用 `copy`**——`copy` 的墨迹阈值会把黑袍当一整块墨，只出 160 根长线。`minArea`（默认面积/4000）、`maxFills`（默认 1600）、`tolerance`、`colors` 可调 |
 | `fix` | **自动补漏**：只看 compare 的 `topGaps` 重描最漏的几块，`target=90`、`maxRounds=3`，达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过（`skippedHoles`） |
 | `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调；区域里的洞按轮廓嵌套自动挖掉（`evenodd` 填充） |
 | `select` | 选区：`rect=[x,y,w,h]` 或 `points`（套索），之后落笔只保留选区内的点（越界会切段）；`clearSelection=true` 取消 |
@@ -175,26 +176,27 @@ https://github.com/RUO-MO/dsh-draworld
 | `trace` | 参考图 → 轮廓折线：返回 `paths`（画布坐标，直接当 draw 的 points），`threshold` 调深浅、`tolerance` 调概括；`mode=center` 走骨架中心线（线稿用），默认 `edge` 沿墨迹边界；`smooth=0~3` 控制磨圆遍数（默认 1），`fit=true` 改用三次贝塞尔拟合（长弧一条曲线走完） |
 | `pick` | 读某点颜色与透明度（`x`、`y`，`on=ref/canvas`）：`ink=true` 说明这点在线条上 |
 | `compare` | 当前画面 vs 参考图：差分图（品红=漏画、青=多画）+ `coveragePct`、`extraPct`、`meanColorDiff`、`topGaps`（最漏的几块） |
-| `palette` | 参考图主色聚类（真 k-means，`k` 2~8）+ 每色占比 |
+| `palette` | 参考图主色聚类（真 k-means，`k` 2~12）+ 每色占比 |
 | `snapshot` / `restore` | 整幅存档 / 回到某一版（比逐笔 undo 干净，跨进程也在） |
 | `layer` | `layerOp=list/add/select/set/remove`；`set` 改 `name`、`visible`、`layerOpacity`、`blend`、`locked`（锁住就画不上去、也擦不掉） |
-| `import` | 本机图片或 dataUrl 导入成最底层；`fit=contain/cover/stretch` |
+| `import` | 本机图片或 dataUrl 导入成最底层；落位用 `placement=contain/cover/stretch`（旧的 `fit` 字符串仍兼容） |
 | `canvas` | 改尺寸（16~4096）与背景 |
 | `new` | 另起一幅：可先 `save` 存当前，或给 `path`/`dataUrl` 按图建画布 |
-| `export` | 把最新渲染另存 PNG 到保存路径（`transparent=true` 取透明底） |
+| `export` | 把最新渲染另存 PNG（`path` 给路径、`transparent=true` 取透明底）；**面板没开时宿主用 `rasterDoc` 自己画一遍再导出（0.1.40 起）**，不再等前端回传 |
 | `undo` / `redo` | 按全局顺序撤/恢复最近 N 笔 |
 | `clear` | 清空整幅；带 `layer` 只清那层（`all`/`*` 等同整幅） |
 
-**复刻一张图**的闭环：最省模型能力的是 `copy` → `fix` 两条命令；想手工精修再按 `ref` 看细节 → `palette` 定配色 → `trace` 抽轮廓 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
+**复刻一张图**的闭环：彩稿走 `posterize`（色阶分区铺色 ± 边界线稿），线稿走 `copy`/`trace` → 再 `fix` 补漏；想手工精修再按 `ref` 看细节 → `palette` 定配色 → `trace` 抽轮廓 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
 
 **改局部别糊整幅**：先 `select` 框住范围（`rect` 或套索 `points`），再 `draw` / `fill`，越界点会被裁掉；改完 `select clearSelection=true`。选区存在 `doc.json` 的 `selection` 字段里，会跟着文档走。
 
 **像素任务（两套引擎，自动择一）**：裁切、取色、差分、主色、描线、复刻、填色这些活有两处可算。
 
-- **前端**：浏览器早就把参考图解码进 `<canvas>` 了，最快。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。
+- **前端**：浏览器早就把参考图解码进 `<canvas>` 了，最快。宿主把任务塞队列，前端 500ms 轮询 `/canvas-api/jobs` 取走（0.1.40 起由 700ms 缩短），算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。
 - **宿主侧（0.1.35 起）**：面板没开（`/jobs` 2.5 秒没人来取）时，宿主自己算——`pixels.js` 是纯 JS 的 PNG 解码/编码（8bit，colorType 0/2/4/6，不支持调色板/隔行/16bit）+ 光栅化 + marching squares / Zhang-Suen 骨架 / RDP / Chaikin / 三次贝塞尔，`pixelops.js` 跑 crop / ref / pick / palette / trace / copy / fill / compare。所以「不开界面也能 `copy` → `fix`」这条已经通了，不再 5 秒超时。非 PNG 参考图（JPEG 等）会用 PowerShell 的 `System.Drawing` 转一次临时 PNG 再读。
 - 宿主算不出来才回落到队列，超时默认 5 秒（`trace`/`copy`/`fill`/`compare`/`palette` 这类整幅重活 30 秒，`heavyTimeout` 可调）、话术直说「宿主侧没算成、面板也没接任务」。不想让宿主插手、只走浏览器：插件配置写 `headless: false`（也可 `POST /canvas-api/config {"headless": false}` 临时切）。
 - **`trace` 带调参反馈（0.1.39 起）**：返回体里多了 `stats` —— `inkRatio`（墨迹占比，判断阈值是不是把阴影也吃进来了）、`widthAvg/Min/Max`（量出来的线宽，拿来设笔刷 size）、`pointsPerLine`（重采样疏密，对应 `fitStep`/`step`）、`droppedPct`（被 `minLength` 丢掉的短段比例）。调 `threshold`/`tolerance`/`fitStep` 时看这几个数，不用只靠肉眼比成品。
+- **画的过程能看见了（0.1.40 起）**：前端 tick 里发现「最上层追加了普通笔迹、其他层没变」就直接 paintStroke 补画那一笔（paintAppended），不再整幅 enderDoc 重绘；轮询 500ms。模型一批 300 笔过去，画布是逐笔长出来的，跳变间隔从 0.7 秒缩到半秒。
 - **图片类型按内容判**：`import` 不看扩展名，读魔数认 PNG / JPEG / WebP / GIF，缓存名统一是 `img-<stamp>-<rand>.<真扩展名>`；`ref` 遇到非 PNG 会先转一份 `views/ref-…-<mtime>.png` 再交给 `read_image`（同一文件按 mtime 复用，原文件保留不动）。
 
 **填色边界**：`copy` 走中心线时，色块另跑一遍边界追踪取闭合轮廓（骨架不闭合），洞按嵌套层数 even-odd 挖掉；`fill` 的泛洪边界只认笔迹（不含已填色块），区域撞到「超过画布 62%」会拒填并提示先有线稿或用 `rect` 收窄。
