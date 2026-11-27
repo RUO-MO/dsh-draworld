@@ -180,7 +180,13 @@ https://github.com/RUO-MO/dsh-draworld
 
 **改局部别糊整幅**：先 `select` 框住范围（`rect` 或套索 `points`），再 `draw` / `fill`，越界点会被裁掉；改完 `select clearSelection=true`。选区存在 `doc.json` 的 `selection` 字段里，会跟着文档走。
 
-**像素任务**：裁切、取色、差分、主色这些活在前端算——浏览器早就把参考图解码进 `<canvas>` 了，宿主只搬运，不引 `@napi-rs/canvas` 这类依赖。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。超时 5 秒，报错会直说「需要在浏览器里打开画界面板」。
+**像素任务（两套引擎，自动择一）**：裁切、取色、差分、主色、描线、复刻、填色这些活有两处可算。
+
+- **前端**：浏览器早就把参考图解码进 `<canvas>` 了，最快。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。
+- **宿主侧（0.1.35 起）**：面板没开（`/jobs` 2.5 秒没人来取）时，宿主自己算——`pixels.js` 是纯 JS 的 PNG 解码/编码（8bit，colorType 0/2/4/6，不支持调色板/隔行/16bit）+ 光栅化 + marching squares / Zhang-Suen 骨架 / RDP / Chaikin / 三次贝塞尔，`pixelops.js` 跑 crop / ref / pick / palette / trace / copy / fill / compare。所以「不开界面也能 `copy` → `fix`」这条已经通了，不再 5 秒超时。非 PNG 参考图（JPEG 等）会用 PowerShell 的 `System.Drawing` 转一次临时 PNG 再读。
+- 宿主算不出来才回落到队列，超时 5 秒、话术直说「宿主侧没算成、面板也没接任务」。不想让宿主插手、只走浏览器：插件配置写 `headless: false`（也可 `POST /canvas-api/config {"headless": false}` 临时切）。
+
+**填色边界**：`copy` 走中心线时，色块另跑一遍边界追踪取闭合轮廓（骨架不闭合），洞按嵌套层数 even-odd 挖掉；`fill` 的泛洪边界只认笔迹（不含已填色块），区域撞到「超过画布 62%」会拒填并提示先有线稿或用 `rect` 收窄。
 
 **会话绑定**：工具和画布协议挂在 `agent.ctx` 上，只有打开过画界的会话才有。打开画界时前端 POST `/canvas-api/attach`（带 `sessionId`），关掉 15 秒后 `/detach`。attach 会先按 id 找 agent（`get` 找不到就从列表里翻），找不到就每秒重试、最多 20 秒；20 秒还拿不到就**退回全局注册**（`diagnostics.scope.fallback = "attach-pending"`），保证工具至少能用。想直接退回「所有会话都有」：插件配置写 `toolScope: "global"`（不推荐，会把正在写代码的会话带偏）。
 
@@ -237,11 +243,13 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本�
 - 选区只有矩形与套索，没有魔棒；选区没有可视化的虚线框（只生效在落笔裁切上），`fill` 的边界也只认笔迹、不认选区。
 - 混合模式只有 `normal` 与 `multiply`；滤镜、液化、透视变形属于像素管线，暂不做。
 - 图层不能拖动排序、合并、复制，也不能双击改名。
-- `view` / `ref` / `pick` / `compare` / `palette` / `copy` / `fix` / `fill` 依赖界面渲染：画界面板至少打开过一次、前端在跑；没开时像素任务 5 秒超时并直说原因。
+- `view` / `ref` / `pick` / `compare` / `palette` / `copy` / `fix` / `fill` / `trace` 在没有界面时由宿主侧算（0.1.35 起），结果与面板渲染会有细微差异（笔刷边缘、抗锯齿），量线宽、覆盖率这类指标仍然可信。
 - `fill` 会按轮廓嵌套挖洞（区域里的高光、瞳孔不会被涂掉），但只在同一片连通区域里生效；种子点落在连通整片背景时会直接拒绝，提示你先有线稿或缩小 `rect`。
 - `copy` 的自动判断看墨迹占比：线稿（占比 <13%）走中心线，照片走得边界；整幅偏灰、扫描发白时可能判成照片，此时显式传 `mode="center"` 更稳。
 - `copy` 的色块也按轮廓嵌套挖洞；洞的判定是「被最小的更大闭合轮廓包住」，所以线断开、区域没闭合的地方不会被当成洞。
 - `trace` / `copy` 的 `smooth` 会磨圆尖角：画得太顺但丢了锐角时给 0 或 1；要更顺给 3。`copy` 默认走贝塞尔拟合，发梢这类锐角可能被圆弧化，介意就 `fit=false`。
+- `mode="center"` 的骨架追踪会给粗线量出中心路径，但交叉、发丝并线处会被切成多段（一条长线变几条短线），需要连笔时用 `mode="edge"` 或事后手工补。
+- 宿主侧只吃 8bit PNG（不带调色板、不隔行、不是 16bit）；JPEG／WebP 会先转临时 PNG 再读，转出来的尺寸与原图一致，但色彩按系统解码器的默认色彩空间算。
 - 线宽沿法线量、上限 16px：极粗的块面会被量宽，此时给 `size` 或用 `splitLines` 把它单独分到「粗线」层。
 - `trace` 抽的是「墨迹边界」不是中心线：线很粗或图很糊时，描出来会略微偏外；`tolerance` 给到 2~4 通常能压成一条线。
 - 会话绑定对「打开画界之后」的请求生效；打开前发出的那一步还看不到 `paint_canvas`。

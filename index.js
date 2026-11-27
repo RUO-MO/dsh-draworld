@@ -947,6 +947,7 @@ function parseRect(input, width, height) {
   if (Array.isArray(input) && input.length >= 4) src = { x: input[0], y: input[1], w: input[2], h: input[3] };
   else if (input && typeof input === "object") src = input;
   const num = (v, fallback) => {
+    if (v === null || v === undefined || v === "") return fallback;
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
@@ -1214,9 +1215,38 @@ export function apply(ctx, config = {}) {
   const PIXEL_TIMEOUT_MS = Math.max(1500, Number(config.pixelTimeout || 5000));
   const jobs = new Map();
   let jobSeq = 0;
-  const jobStats = { done: 0, timeout: 0, failed: 0, queued: 0, last: null };
+  const jobStats = { done: 0, timeout: 0, failed: 0, queued: 0, headless: 0, last: null };
+
+  // 面板在不在：前端每 700ms 轮询一次 /jobs，2.5 秒没动静就当作没有面板 → 宿主机自己算
+  const panelLive = () => Date.now() - (state.panelAt || 0) < 2500;
+  const HEADLESS_KINDS = new Set(["crop", "ref", "pick", "palette", "trace", "copy", "fill", "compare"]);
+
+  const runHeadlessPixel = async (kind, params) => {
+    try {
+      const mod = await import("./pixelops.js");
+      const out = await mod.runHeadless(kind, params, docs.doc, (file) => path.resolve(dir, file));
+      jobStats.done += 1;
+      jobStats.headless += 1;
+      jobStats.last = { kind, at: Date.now(), mode: "host" };
+      return out;
+    } catch (err) {
+      jobStats.failed += 1;
+      return { ok: false, error: `宿主侧算 ${kind} 失败：${(err && err.message) || err}`, headless: true };
+    }
+  };
 
   const runPixelJob = (kind, params = {}, timeoutMs) => new Promise((resolve) => {
+    if (config.headless !== false && HEADLESS_KINDS.has(kind) && !panelLive()) {
+      // 没有面板 → 直接宿主侧算，不再干等 5 秒超时
+      runHeadlessPixel(kind, params).then((out) => {
+        if (out && out.ok) resolve(out);
+        else enqueue();
+      });
+      return;
+    }
+    enqueue();
+
+    function enqueue() {
     jobSeq += 1;
     const id = `j${jobSeq}`;
     const limit = Math.max(1500, Number(timeoutMs) || PIXEL_TIMEOUT_MS);
@@ -1226,7 +1256,7 @@ export function apply(ctx, config = {}) {
       jobStats.timeout += 1;
       resolve({
         ok: false,
-        error: `像素任务超时（${Math.round(limit / 1000)} 秒）：${kind}。需要在浏览器里打开画界面板，渲染与解码都在前端做`,
+        error: `像素任务超时（${Math.round(limit / 1000)} 秒）：${kind}。宿主侧没算成、浏览器里的画界面板又没接任务——打开画界，或者去掉插件配置里的 headless:false`,
       });
     }, limit);
     jobs.set(id, {
@@ -1241,6 +1271,7 @@ export function apply(ctx, config = {}) {
       },
     });
     jobStats.queued += 1;
+    }
   });
 
   /** 前端来取任务：返回所有还没回结果的（前端自己按 id 去重）。 */
@@ -1558,7 +1589,7 @@ export function apply(ctx, config = {}) {
               },
               preview: existsSync(docs.preview) ? docs.preview : null,
               previewAlpha: existsSync(docs.previewAlpha) ? docs.previewAlpha : null,
-              jobs: { ...jobStats, pending: jobs.size },
+              jobs: { ...jobStats, pending: jobs.size, panel: panelLive() ? "live" : "absent", headlessAuto: config.headless !== false },
               update: state.update,
             });
             return;
@@ -1566,6 +1597,7 @@ export function apply(ctx, config = {}) {
 
           // 前端来取像素任务（裁切/取色/差分/主色），算完 POST 回 /job
           if (route === "/jobs" && req.method === "GET") {
+            state.panelAt = Date.now();
             json(res, 200, { ok: true, revision: docs.revision, jobs: pendingJobs() });
             return;
           }
@@ -1620,6 +1652,7 @@ export function apply(ctx, config = {}) {
               saveDir: paths.saveDir(),
               rootDir,
               followSaveDir: paths.values.saveDir === null,
+              headless: config.headless !== false,
               defaults: {
                 width: DEFAULT_DOC.width,
                 height: DEFAULT_DOC.height,
@@ -1633,6 +1666,9 @@ export function apply(ctx, config = {}) {
           if (route === "/config" && req.method === "POST") {
             try {
               const body = JSON.parse((await readBody(req)) || "{}");
+              if (body.headless !== undefined) {
+                config.headless = body.headless === true || body.headless === 1 || body.headless === "1" || body.headless === "true";
+              }
               const moved = paths.set({ cacheDir: body.cacheDir, saveDir: body.saveDir });
               if (moved.cacheDir !== undefined) {
                 docs.relocate(moved.cacheDir);

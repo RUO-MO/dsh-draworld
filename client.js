@@ -1070,7 +1070,7 @@ window.__ModuleLoader__.load({
 
     function parseRectIn(rect, doc) {
       const src = Array.isArray(rect) ? { x: rect[0], y: rect[1], w: rect[2], h: rect[3] } : (rect || {});
-      const n = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+      const n = (v, d) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
       const x = Math.max(0, Math.round(n(src.x, 0)));
       const y = Math.max(0, Math.round(n(src.y, 0)));
       const w = Math.max(1, Math.round(n(src.w, (doc.width || 1024) - x)));
@@ -1706,7 +1706,13 @@ window.__ModuleLoader__.load({
         if (wantFit && simplified.length >= 3) {
           const segsFit = fitBezier(simplified, tolFit);
           const sampled = bezierSample(segsFit, fitStep, maxPointsPerLine * 2);
-          if (sampled.length >= 2) simplified = sampled;
+          if (sampled.length >= 2) {
+            // 闭合环拟合容易外冲，夹回画布内，否则色块 bbox 会虚大
+            simplified = sampled.map((p) => [
+              Math.max(0, Math.min(w - 1, p[0])),
+              Math.max(0, Math.min(h - 1, p[1])),
+            ]);
+          }
         } else if (smoothIters > 0) {
           // 磨圆一遍再收紧：像素阶梯走出来的折角会被抹掉，线看起来才是「画」出来的
           simplified = smoothPath(simplified, closed, smoothIters);
@@ -2024,7 +2030,12 @@ window.__ModuleLoader__.load({
         const segs = marchingSquares(region, W, H);
         // 轮廓嵌套：偶数层是区域（要涂），奇数层是洞（evenodd 挖掉）
         const loops = stitchSegments(segs)
-          .map((raw) => ({ pts: rdp(raw.map((p) => [p[0] / 2, p[1] / 2]), 1.5) }))
+          .map((raw) => {
+            const pts = raw.map((p) => [p[0] / 2, p[1] / 2]);
+            // 闭环的首点会在末尾重复一次；首尾同点时 rdp 会整条塌成两点，先去掉重尾
+            if (pts.length > 3 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1.5) pts.pop();
+            return { pts: rdp(pts, 1.5) };
+          })
           .map((v) => ({ ...v, area: polygonArea(v.pts) }))
           .filter((v) => v.area > 40)
           .sort((a, b) => b.area - a.area)
@@ -2145,8 +2156,22 @@ window.__ModuleLoader__.load({
         });
         const palette = kmeansColors(img.data, Math.max(2, Math.min(8, Number(params.colors) || 6)), 3);
         const wantFill = params.style === 'flat' || params.style === 'anime';
+        // 色块必须靠闭合轮廓；中心线模式下的路径是骨架，不闭合，所以填色另跑一遍边界追踪
+        let edgeTrace = traced;
+        if (wantFill && mode === 'center') {
+          edgeTrace = traceInk(img.data, rect.w, rect.h, {
+            mode: 'edge',
+            smooth: params.smooth === undefined ? 2 : params.smooth,
+            fit: false,
+            threshold: params.threshold,
+            tolerance: params.tolerance,
+            minLength: params.minLength === undefined ? 16 : params.minLength,
+            maxLines: params.maxLines || 160,
+            maxPointsPerLine: params.maxPointsPerLine || 120,
+          });
+        }
         const fills = wantFill
-          ? regionFills(c, rect, traced, palette, { minFill: params.minFill, maxFills: params.maxFills || 40 })
+          ? regionFills(c, rect, edgeTrace, palette, { minFill: params.minFill, maxFills: params.maxFills || 40 })
           : [];
         const paths = traced.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
         // 每根线的墨宽：中心线模式下量出来就是原线宽，宿主照这个 size 落笔
