@@ -744,6 +744,20 @@ window.__ModuleLoader__.load({
     function paintStroke(g, stroke) {
       const pts = stroke.points || [];
       if (pts.length < 2) return;
+      // 填充笔迹：points 是一个多边形，直接填色（copy 出来的色块用它，比刷子糊一万笔准）
+      if (stroke.mode === 'fill') {
+        g.save();
+        g.globalCompositeOperation = 'source-over';
+        g.globalAlpha = stroke.opacity === undefined ? 1 : Math.max(0, Math.min(1, Number(stroke.opacity)));
+        g.fillStyle = stroke.color || '#ffffff';
+        g.beginPath();
+        g.moveTo(Number(pts[0][0]), Number(pts[0][1]));
+        for (let i = 1; i < pts.length; i += 1) g.lineTo(Number(pts[i][0]), Number(pts[i][1]));
+        g.closePath();
+        g.fill();
+        g.restore();
+        return;
+      }
       const eraser = stroke.mode === 'eraser';
       const spec = eraser ? ERASER_SPEC : (BRUSH_BY_ID.get(stroke.brush) || BRUSH_BY_ID.get('round'));
       const size = Number(stroke.size) || 8;
@@ -1153,6 +1167,94 @@ window.__ModuleLoader__.load({
       return lines;
     }
 
+    /** 多边形面积（鞋带公式），用来判断这个闭合轮廓够不够大、值不值得填。 */
+    function polygonArea(pts) {
+      let sum = 0;
+      for (let i = 0; i < pts.length; i += 1) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        sum += a[0] * b[1] - b[0] * a[1];
+      }
+      return Math.abs(sum) / 2;
+    }
+
+    /**
+     * 按闭合轮廓取内部主色，映射到 palette 里最接近的一档 —— 就是「按区域填色」。
+     * 返回 [{ points, color, area }]，points 已换算到画布坐标。
+     */
+    function regionFills(refCanvas, rect, traced, palette, opts = {}) {
+      const minFill = Math.max(20, Number(opts.minFill) || 320);
+      const maxFills = Math.max(1, Number(opts.maxFills) || 60);
+      const cands = traced.paths
+        .map((p, i) => ({ pts: p, closed: Boolean(traced.closed && traced.closed[i]), area: polygonArea(p) }))
+        .filter((c) => c.closed && c.area >= minFill)
+        .sort((a, b) => b.area - a.area);
+      const fills = [];
+      for (const cand of cands) {
+        if (fills.length >= maxFills) break;
+        let x0 = Infinity;
+        let y0 = Infinity;
+        let x1 = -Infinity;
+        let y1 = -Infinity;
+        for (const p of cand.pts) {
+          if (p[0] < x0) x0 = p[0];
+          if (p[1] < y0) y0 = p[1];
+          if (p[0] > x1) x1 = p[0];
+          if (p[1] > y1) y1 = p[1];
+        }
+        const w = Math.max(1, Math.ceil(x1 - x0));
+        const h = Math.max(1, Math.ceil(y1 - y0));
+        // 铺满整块的那条轮廓多半是背景，跳过
+        if (w * h > rect.w * rect.h * 0.82) continue;
+        // 遮罩：把多边形填实
+        const maskCan = surface(w, h);
+        const mg = maskCan.getContext('2d');
+        mg.fillStyle = '#000';
+        mg.beginPath();
+        mg.moveTo(cand.pts[0][0] - x0, cand.pts[0][1] - y0);
+        for (let i = 1; i < cand.pts.length; i += 1) mg.lineTo(cand.pts[i][0] - x0, cand.pts[i][1] - y0);
+        mg.closePath();
+        mg.fill();
+        // 参考图这块 + 用遮罩抠出来
+        const colCan = surface(w, h);
+        const cg = colCan.getContext('2d');
+        cg.drawImage(refCanvas, rect.x + x0, rect.y + y0, w, h, 0, 0, w, h);
+        cg.globalCompositeOperation = 'destination-in';
+        cg.drawImage(maskCan, 0, 0);
+        const data = cg.getImageData(0, 0, w, h).data;
+        // 内部主色（5 位量化取最高档的均值）
+        const buckets = new Map();
+        for (let i = 0; i < data.length; i += 4 * 3) {
+          if (data[i + 3] < 32) continue;
+          const key = ((data[i] >> 3) << 10) | ((data[i + 1] >> 3) << 5) | (data[i + 2] >> 3);
+          const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
+          cur.r += data[i];
+          cur.g += data[i + 1];
+          cur.b += data[i + 2];
+          cur.n += 1;
+          buckets.set(key, cur);
+        }
+        if (buckets.size === 0) continue;
+        const top = [...buckets.values()].sort((a, b) => b.n - a.n)[0];
+        const rgb = [top.r / top.n, top.g / top.n, top.b / top.n];
+        let best = palette[0];
+        let bestD = Infinity;
+        for (const c of palette) {
+          const d = (c.rgb[0] - rgb[0]) ** 2 + (c.rgb[1] - rgb[1]) ** 2 + (c.rgb[2] - rgb[2]) ** 2;
+          if (d < bestD) {
+            bestD = d;
+            best = c;
+          }
+        }
+        fills.push({
+          points: cand.pts.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]),
+          color: best ? best.hex : toHex(Math.round(rgb[0]), Math.round(rgb[1]), Math.round(rgb[2])),
+          area: Math.round(cand.area),
+        });
+      }
+      return fills;
+    }
+
     /**
      * 参考图 → 折线：掩码 → 模糊 → 轮廓 → 简化 → 过滤碎片。
      * 输出坐标是这块区域内的像素坐标（半像素精度），调用方自己加偏移。
@@ -1165,13 +1267,15 @@ window.__ModuleLoader__.load({
       const mask = blurMask(inkMask(imageData, w, h, opts.threshold), w, h);
       const lines = stitchSegments(marchingSquares(mask, w, h));
       const out = [];
+      const closedFlags = [];
       let dropped = 0;
       for (const raw of lines) {
         const pts = raw.map((p) => [p[0] / 2, p[1] / 2]);
         // 闭合环去掉重复的末点（draw 会自己收尾）
         const a = pts[0];
         const b = pts[pts.length - 1];
-        if (pts.length > 3 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 1.5) pts.pop();
+        const closed = pts.length > 3 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 1.5;
+        if (closed) pts.pop();
         let len = 0;
         for (let i = 1; i < pts.length; i += 1) len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
         if (len < minLength) {
@@ -1184,10 +1288,11 @@ window.__ModuleLoader__.load({
           simplified = simplified.filter((_, i) => i % stepN === 0 || i === simplified.length - 1);
         }
         out.push(simplified.map((p) => [Number(p[0].toFixed(1)), Number(p[1].toFixed(1))]));
+        closedFlags.push(closed);
         if (out.length >= maxLines) break;
       }
       const points = out.reduce((n, l) => n + l.length, 0);
-      return { paths: out, lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
+      return { paths: out, closed: closedFlags, lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
     }
 
     /** 主色聚类：真 k-means（初值取量化后占比最高的几档，10 轮迭代）。 */
@@ -1430,6 +1535,47 @@ window.__ModuleLoader__.load({
           topGaps: gaps,
         };
         return { ok: true, dataUrl: diff.toDataURL('image/png'), rect, metrics };
+      }
+
+      if (kind === 'copy') {
+        const layer = params.layer
+          ? layersOf(doc).find((l) => l.image && (l.id === params.layer || l.name === params.layer))
+          : refLayerOf(doc);
+        if (!layer) throw new Error('画布上没有可用的参考图：先 import 一张');
+        const W = doc.width || 1024;
+        const H = doc.height || 1024;
+        const c = surface(W, H);
+        const g = c.getContext('2d');
+        g.clearRect(0, 0, W, H);
+        drawImageLayer(g, layer.image);
+        const rect = parseRectIn(params.rect, doc);
+        const img = g.getImageData(rect.x, rect.y, rect.w, rect.h);
+        const traced = traceInk(img.data, rect.w, rect.h, {
+          threshold: params.threshold,
+          tolerance: params.tolerance,
+          minLength: params.minLength,
+          maxLines: params.maxLines || 160,
+          maxPointsPerLine: params.maxPointsPerLine || 120,
+        });
+        const palette = kmeansColors(img.data, Math.max(2, Math.min(8, Number(params.colors) || 6)), 3);
+        const wantFill = params.style === 'flat' || params.style === 'anime';
+        const fills = wantFill
+          ? regionFills(c, rect, traced, palette, { minFill: params.minFill, maxFills: params.maxFills || 40 })
+          : [];
+        const paths = traced.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
+        return {
+          ok: true,
+          rect,
+          paths,
+          closed: traced.closed,
+          fills,
+          palette,
+          lines: traced.lines,
+          points: traced.points,
+          dropped: traced.dropped,
+          tolerance: traced.tolerance,
+          threshold: traced.threshold,
+        };
       }
 
       if (kind === 'trace') {
@@ -3686,7 +3832,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, regionFills },
       apply(ctx) {
         let t = (k) => k;
         try {

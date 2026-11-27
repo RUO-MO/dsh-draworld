@@ -228,6 +228,10 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
    默认 contain（整张居中放进画布）；之后正常 draw 就是描图。导入后图层里带 \`image\` 字段。
 8. 画布本身也能改：\`action=canvas width=… height=… background=#rrggbb\`；\`action=export\` 把当前渲染另存成 PNG。
 
+**最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
+- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，并顺带跑一次 compare，直接给出覆盖率；
+- \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字。
+
 **复刻一张图**照这个闭环走，不要凭缩略图估坐标：
 - \`action=ref rect=[x,y,w,h] zoom=2\` → read_image 看参考图那块细节；整张就用 \`action=ref\`（返回原图路径）。
 - \`action=pick x=… y=…\` → 读参考图某点的颜色与透明度：\`ink=true\` 说明这点在线条上，\`ink=false\` 就是空白。
@@ -600,7 +604,7 @@ class Document {
         color: s.color || "#111111",
         size: Number(s.size) || 8,
         opacity: s.opacity === undefined ? 1 : Number(s.opacity),
-        mode: s.mode === "eraser" ? "eraser" : "brush",
+        mode: s.mode === "eraser" ? "eraser" : (s.mode === "fill" ? "fill" : "brush"),
         brush: BRUSH_IDS.includes(s.brush) ? s.brush : "round",
         taper: s.taper === true,
         minSize: s.minSize === undefined ? 0.3 : Math.max(0, Math.min(1, Number(s.minSize) || 0)),
@@ -908,6 +912,18 @@ function parseRect(input, width, height) {
   };
 }
 
+/** 颜色亮度：挑「最像墨」的那一档当线色。支持 {rgb} 或 {hex}。 */
+function lumOf(c) {
+  if (!c) return 999;
+  if (Array.isArray(c.rgb)) return 0.299 * c.rgb[0] + 0.587 * c.rgb[1] + 0.114 * c.rgb[2];
+  const hex = String(c.hex || "").replace("#", "");
+  if (hex.length < 6) return 999;
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
 /** 每层的包围盒与「占了多少画布」，用来回答"哪块还没画"。 */
 function layerDetails(docx) {
   const width = docx.width || 1024;
@@ -1084,18 +1100,19 @@ export function apply(ctx, config = {}) {
   let jobSeq = 0;
   const jobStats = { done: 0, timeout: 0, failed: 0, queued: 0, last: null };
 
-  const runPixelJob = (kind, params = {}) => new Promise((resolve) => {
+  const runPixelJob = (kind, params = {}, timeoutMs) => new Promise((resolve) => {
     jobSeq += 1;
     const id = `j${jobSeq}`;
+    const limit = Math.max(1500, Number(timeoutMs) || PIXEL_TIMEOUT_MS);
     const timer = setTimeout(() => {
       if (!jobs.has(id)) return;
       jobs.delete(id);
       jobStats.timeout += 1;
       resolve({
         ok: false,
-        error: `像素任务超时（${Math.round(PIXEL_TIMEOUT_MS / 1000)} 秒）：${kind}。需要在浏览器里打开画界面板，渲染与解码都在前端做`,
+        error: `像素任务超时（${Math.round(limit / 1000)} 秒）：${kind}。需要在浏览器里打开画界面板，渲染与解码都在前端做`,
       });
-    }, PIXEL_TIMEOUT_MS);
+    }, limit);
     jobs.set(id, {
       id,
       kind,
@@ -1697,7 +1714,7 @@ export function apply(ctx, config = {}) {
       properties: {
         action: {
           type: "string",
-          enum: ["doc", "draw", "view", "ref", "trace", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
+          enum: ["doc", "copy", "fix", "draw", "view", "ref", "trace", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
           description: "要执行的动作。new 是另起一幅（可先保存当前、也可用图片建画布）。",
         },
         points: {
@@ -1811,6 +1828,16 @@ export function apply(ctx, config = {}) {
         },
         minLength: { type: "number", description: "trace: 丢掉的短线段长度下限（像素），默认 12，用来滤掉噪点。" },
         maxLines: { type: "number", description: "trace: 最多返回几条折线，默认 80。" },
+        style: {
+          type: "string",
+          enum: ["lineart", "flat", "anime"],
+          description: "copy: 复刻风格。lineart 只出线稿；flat 只出区域色块；anime 出线稿+色块（默认）。",
+        },
+        colors: { type: "number", description: "copy / palette: 主色档数 2~8，默认 6。" },
+        minFill: { type: "number", description: "copy: 小于多少像素的闭合区域不填色，默认 320。" },
+        target: { type: "number", description: "fix: 目标覆盖率百分比，默认 90。到了就停。" },
+        maxRounds: { type: "number", description: "fix: 最多迭代几轮，默认 3（上限 5）。" },
+        refLayer: { type: "string", description: "copy / fix: 用哪一个图片层当参考图，默认第一张可见图片层。" },
         k: { type: "number", description: "palette: 要几档主色，默认 6（上限 8）。" },
         snapshotId: { type: "string", description: "restore: 回退到哪一版快照（snapshot 返回的 id）；不给回最近一版。" },
         label: { type: "string", description: "snapshot: 这版备注，比如「上色前」。" },
@@ -2120,6 +2147,130 @@ export function apply(ctx, config = {}) {
               width: job.width,
               height: job.height,
               hint: "参考图的这块裁切，用 read_image 看。",
+            };
+          }
+          case "copy": {
+            const style = args.style === "lineart" || args.style === "flat" ? args.style : "anime";
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const job = await runPixelJob("copy", {
+              rect,
+              style,
+              layer: args.refLayer === undefined ? null : args.refLayer,
+              threshold: args.threshold,
+              tolerance: args.tolerance,
+              minLength: args.minLength,
+              maxLines: args.maxLines,
+              colors: args.colors,
+              minFill: args.minFill,
+            }, PIXEL_TIMEOUT_MS * 3);
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            const created = [];
+            // 同名空层直接复用，避免反复 copy 堆出一串「线稿 2」「色块 3」
+            const pickLayer = (name) => {
+              const want = String(name || "").trim();
+              const found = want ? docs.layer(want) : null;
+              if (found && !found.locked && !found.image && (found.strokes || []).length === 0) return found;
+              return docs.addLayer(want || undefined);
+            };
+            // 先铺色块（在线稿下面），再描线，顺序就是画师的习惯
+            if (style !== "lineart" && job.fills.length > 0) {
+              const layer = pickLayer(args.fillLayer || "色块");
+              docs.append(
+                job.fills.map((f) => ({ mode: "fill", color: f.color, size: 1, opacity: 1, points: f.points })),
+                layer.id,
+              );
+              created.push({ name: layer.name, kind: "fill", items: job.fills.length });
+            }
+            if (style !== "flat" && job.paths.length > 0) {
+              const palette = job.palette || [];
+              const darkest = palette.length
+                ? palette.reduce((a, b) => (lumOf(a) <= lumOf(b) ? a : b))
+                : null;
+              const layer = pickLayer(args.layer || "线稿");
+              const brush = BRUSH_IDS.includes(args.brush) ? args.brush : "liner";
+              const size = Math.max(1, Number(args.size) || 3);
+              const strokes = job.paths
+                .filter((p) => p && p.length >= 2)
+                .map((points) => ({ color: args.color || (darkest && darkest.hex) || "#111111", size, brush, opacity: 1, points }));
+              docs.append(strokes, layer.id);
+              created.push({ name: layer.name, kind: "line", items: strokes.length });
+            }
+            // 自动验收，让模型不用再问一次
+            const cmp = await runPixelJob("compare", { rect: job.rect }, PIXEL_TIMEOUT_MS * 2);
+            return {
+              ok: true,
+              revision: docs.revision,
+              style,
+              rect: job.rect,
+              created,
+              palette: job.palette,
+              lines: job.lines,
+              fills: job.fills.length,
+              points: job.points,
+              metrics: cmp.ok ? cmp.metrics : null,
+              hint: `已按 ${style} 复刻：${created.map((c) => `${c.name}(${c.items})`).join(" + ") || "没有可画的内容"}。`
+                + (cmp.ok ? `覆盖率 ${cmp.metrics.coveragePct}%，多画 ${cmp.metrics.extraPct}%。` : "（验收没跑成，稍后 action=compare 再看）")
+                + "想补差距就 action=fix。",
+            };
+          }
+          case "fix": {
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const maxRounds = Math.max(1, Math.min(5, Math.round(Number(args.maxRounds) || 3)));
+            const target = Math.max(30, Math.min(99, Number(args.target) || 90));
+            const rounds = [];
+            let last = null;
+            for (let i = 0; i < maxRounds; i += 1) {
+              const cmp = await runPixelJob("compare", { rect }, PIXEL_TIMEOUT_MS * 2);
+              if (!cmp.ok) return { ok: false, error: cmp.error, rounds, revision: docs.revision };
+              last = cmp.metrics;
+              const entry = {
+                round: i + 1,
+                coveragePct: cmp.metrics.coveragePct,
+                extraPct: cmp.metrics.extraPct,
+                gaps: (cmp.metrics.topGaps || []).length,
+              };
+              rounds.push(entry);
+              if (cmp.metrics.coveragePct >= target) break;
+              const gaps = (cmp.metrics.topGaps || []).slice(0, 2);
+              if (gaps.length === 0) break;
+              let added = 0;
+              for (const g of gaps) {
+                const x = Math.max(0, Math.round(g.x) - 6);
+                const y = Math.max(0, Math.round(g.y) - 6);
+                const w = Math.min(docs.doc.width - x, Math.round(g.w) + 12);
+                const h = Math.min(docs.doc.height - y, Math.round(g.h) + 12);
+                if (w < 4 || h < 4) continue;
+                const tr = await runPixelJob("trace", {
+                  rect: [x, y, w, h],
+                  layer: args.refLayer === undefined ? null : args.refLayer,
+                  threshold: args.threshold === undefined ? 0.5 : args.threshold,
+                  tolerance: Math.min(2, Number(args.tolerance) || 2),
+                  minLength: 6,
+                  maxLines: 30,
+                }, PIXEL_TIMEOUT_MS * 2);
+                if (!tr.ok || !tr.paths.length) continue;
+                const brush = BRUSH_IDS.includes(args.brush) ? args.brush : "liner";
+                const strokes = tr.paths
+                  .filter((p) => p.length >= 2)
+                  .map((points) => ({ color: args.color || "#111111", size: Math.max(1, Number(args.size) || 3), brush, points }));
+                if (strokes.length === 0) continue;
+                docs.append(strokes, args.layer || "线稿");
+                added += strokes.length;
+              }
+              entry.addedStrokes = added;
+              if (added === 0) break;
+            }
+            // 收尾再验收一次，数字才是补完后的
+            const final = await runPixelJob("compare", { rect }, PIXEL_TIMEOUT_MS * 2);
+            return {
+              ok: true,
+              revision: docs.revision,
+              rounds,
+              metrics: final.ok ? final.metrics : last,
+              target,
+              hint: final.ok
+                ? `补了 ${rounds.reduce((n, r) => n + (r.addedStrokes || 0), 0)} 笔，覆盖率 ${final.metrics.coveragePct}%（目标 ${target}%）。`
+                : "补完了但验收没跑成，稍后 action=compare 看。",
             };
           }
           case "trace": {
