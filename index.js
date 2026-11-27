@@ -256,7 +256,7 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 - \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
   改局部之前先设选区，就不会糊到整幅。
-- \`action=trace mode="center"\` 走骨架中心线，适合线稿/细线参考图（默认 edge 沿墨迹边界）。
+- \`action=trace mode="center"\` 走骨架中心线，适合线稿/细线参考图（默认 edge 沿墨迹边界）；\`smooth=0~3\` 控制磨圆遍数（默认 1），线还在抖就给 3。
 
 **复刻一张图**照这个闭环走，不要凭缩略图估坐标：
 - \`action=ref rect=[x,y,w,h] zoom=2\` → read_image 看参考图那块细节；整张就用 \`action=ref\`（返回原图路径）。
@@ -1940,8 +1940,12 @@ export function apply(ctx, config = {}) {
           type: "number",
           description: "trace: 折线简化容差（像素），默认 2.5。大一点更概括，小一点更贴边。",
         },
-        minLength: { type: "number", description: "trace: 丢掉的短线段长度下限（像素），默认 12，用来滤掉噪点。" },
+        minLength: { type: "number", description: "trace: 丢掉的短线段长度下限（像素），默认 12（copy 默认 16），用来滤掉噪点。" },
         maxLines: { type: "number", description: "trace: 最多返回几条折线，默认 80。" },
+        smooth: {
+          type: "number",
+          description: "trace / copy: 描线后磨圆几遍 0~3，默认 trace 1、copy 2。觉得线还是抖就给 3；要贴原图硬边就给 0。",
+        },
         style: {
           type: "string",
           enum: ["lineart", "flat", "anime"],
@@ -2338,6 +2342,7 @@ export function apply(ctx, config = {}) {
               maxLines: args.maxLines,
               colors: args.colors,
               minFill: args.minFill,
+              smooth: args.smooth,
               mode: args.mode,
             }, PIXEL_TIMEOUT_MS * 3);
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
@@ -2405,6 +2410,7 @@ export function apply(ctx, config = {}) {
               style,
               rect: job.rect,
               mode: job.mode || null,
+              smooth: job.smooth === undefined ? null : job.smooth,
               inkRatio: job.inkRatio === undefined ? null : job.inkRatio,
               lineWidth: job.lineWidth === undefined ? null : job.lineWidth,
               widths: Array.isArray(job.widths) ? job.widths : null,
@@ -2492,6 +2498,7 @@ export function apply(ctx, config = {}) {
               tolerance: args.tolerance,
               minLength: args.minLength,
               maxLines: args.maxLines,
+              smooth: args.smooth,
               mode: args.mode === "center" ? "center" : "edge",
             });
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
@@ -2504,6 +2511,7 @@ export function apply(ctx, config = {}) {
               dropped: job.dropped,
               tolerance: job.tolerance,
               threshold: job.threshold,
+              smooth: job.smooth === undefined ? null : job.smooth,
               paths: job.paths,
               hint: "paths 是从参考图抽出的轮廓折线（画布坐标），每段直接当 draw 的 points 用；长图可分批 batches=[…]。"
                 + "描完用 view rect+zoom 对照，再用 compare 看 coveragePct。",

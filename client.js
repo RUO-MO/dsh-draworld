@@ -368,7 +368,18 @@ window.__ModuleLoader__.load({
       { id: 'sparkle', group: 'fx', engine: 'scatter', w: 1.3, minRatio: 0.4 },
     ];
     const BRUSH_IDS = BRUSHES.map((b) => b.id);
-    const BRUSH_BY_ID = new Map(BRUSHES.map((b) => [b.id, b]));
+    // 笔刷的中文名：界面上「笔 · 圆头」这类显示要用，之前缺这张表所以显示成 undefined
+    const BRUSH_LABELS = {
+      round: '圆头', hard: '硬边圆', softround: '软边圆', ballpoint: '圆珠笔', marker: '马克笔', flat: '平头',
+      liner: '勾线笔', gpen: 'G 笔', ink: '墨水笔', outline: '描边笔', willow: '柳叶笔',
+      pencil: '铅笔', sketch: '素描铅笔', charcoal: '炭笔', charcoalStick: '炭条', chalk: '粉笔',
+      watercolor: '水彩笔', wash: '铺色', wetedge: '湿边', blender: '晕染',
+      inkbrush: '水墨毛笔', hairbrush: '尖锋毛笔', drybrush: '干笔',
+      oil: '油画笔', impasto: '厚涂', palette: '刮刀',
+      airbrush: '软喷枪', airhard: '硬喷枪', airnoise: '噪点喷枪',
+      halftone: '漫画网点', glow: '光效', sparkle: '粒子',
+    };
+    const BRUSH_BY_ID = new Map(BRUSHES.map((b) => [b.id, { ...b, label: b.label || BRUSH_LABELS[b.id] || b.id }]));
     const BRUSH_GROUPS = ['basic', 'line', 'sketch', 'water', 'inkwash', 'oil', 'air', 'fx'];
     const ERASER_SPEC = { id: 'round', engine: 'solid', w: 1, minRatio: 0.3 };
 
@@ -741,11 +752,76 @@ window.__ModuleLoader__.load({
      * 按笔刷把一笔画出来：宽度随压感变，taper=true 时起收笔渐细，具体落笔交给 engine。
      * 橡皮固定走圆头实心，在图层上擦成透明（destination-out）。
      */
+    /** Chaikin 角切：把折线磨圆一遍，点会变多，形状更顺。 */
+    function chaikin(pts, closed) {
+      const n = pts.length;
+      if (n < 3) return pts;
+      const out = [];
+      if (!closed) out.push(pts[0]);
+      const limit = closed ? n : n - 1;
+      for (let i = 0; i < limit; i += 1) {
+        const p = pts[i];
+        const q = pts[(i + 1) % n];
+        out.push([p[0] * 0.75 + q[0] * 0.25, p[1] * 0.75 + q[1] * 0.25]);
+        out.push([p[0] * 0.25 + q[0] * 0.75, p[1] * 0.25 + q[1] * 0.75]);
+      }
+      if (!closed) out.push(pts[n - 1]);
+      return out;
+    }
+
+    /** 描线的后处理：Chaikin 磨圆 + 轻微 RDP 收紧，出来就是一条顺的线而不是锯齿折线。 */
+    function smoothPath(pts, closed, iterations) {
+      const iters = Math.max(0, Math.min(3, Number(iterations) || 0));
+      if (iters === 0 || pts.length < 3) return pts;
+      let s = pts;
+      for (let k = 0; k < iters; k += 1) s = chaikin(s, closed);
+      // 磨圆之后点会翻倍，用很小容差压一下，保留曲率但别把点堆成山
+      return rdp(s, 0.6);
+    }
+
+    /**
+     * 渲染前的曲线补点：稀疏折线用 Catmull-Rom 补成曲线采样。
+     * 这是「线条不流畅」的另一半原因——数据再顺，直接 lineTo 连接也会一段一段带折角。
+     */
+    function curvePts(pts) {
+      const n = pts.length;
+      if (n < 3) return pts;
+      let total = 0;
+      for (let i = 1; i < n; i += 1) total += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+      const avg = total / (n - 1);
+      if (avg <= 2.5 || n > 4000) return pts;
+      const samples = Math.max(2, Math.min(8, Math.round(avg / 2)));
+      const pAt = (i) => pts[Math.max(0, Math.min(n - 1, i))];
+      const out = [pts[0]];
+      const hasPressure = pts[0].length > 2;
+      for (let i = 0; i < n - 1; i += 1) {
+        const p0 = pAt(i - 1);
+        const p1 = pAt(i);
+        const p2 = pAt(i + 1);
+        const p3 = pAt(i + 2);
+        for (let s = 1; s <= samples; s += 1) {
+          const t = s / samples;
+          const t2 = t * t;
+          const t3 = t2 * t;
+          const x = 0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+          const y = 0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+          if (hasPressure && p1.length > 2 && p2.length > 2) {
+            const pr = Number(p1[2]) + (Number(p2[2]) - Number(p1[2])) * t;
+            out.push([x, y, pr]);
+          } else {
+            out.push([x, y]);
+          }
+        }
+      }
+      return out;
+    }
+
     function paintStroke(g, stroke) {
-      const pts = stroke.points || [];
-      if (pts.length < 2) return;
+      const rawPts = stroke.points || [];
+      if (rawPts.length < 2) return;
       // 填充笔迹：points 是一个多边形，直接填色（copy 出来的色块用它，比刷子糊一万笔准）
       if (stroke.mode === 'fill') {
+        const pts = rawPts;
         g.save();
         g.globalCompositeOperation = 'source-over';
         g.globalAlpha = stroke.opacity === undefined ? 1 : Math.max(0, Math.min(1, Number(stroke.opacity)));
@@ -768,6 +844,8 @@ window.__ModuleLoader__.load({
         return;
       }
       const eraser = stroke.mode === 'eraser';
+      // 笔迹补成曲线再画：稀疏控制点直连会出折角，这是「线条不流畅」的主因之一
+      const pts = curvePts(rawPts);
       const spec = eraser ? ERASER_SPEC : (BRUSH_BY_ID.get(stroke.brush) || BRUSH_BY_ID.get('round'));
       const size = Number(stroke.size) || 8;
       const defaultMin = spec.minRatio === undefined ? 0.3 : spec.minRatio;
@@ -1460,6 +1538,7 @@ window.__ModuleLoader__.load({
       const minLength = Math.max(2, Number(opts.minLength) || 12);
       const maxLines = Math.max(1, Number(opts.maxLines) || 80);
       const maxPointsPerLine = Math.max(6, Number(opts.maxPointsPerLine) || 160);
+      const smoothIters = Math.max(0, Math.min(3, opts.smooth === undefined ? 1 : Number(opts.smooth) || 0));
       let lines;
       if (center) {
         // 中心线：先细化成 1px 骨架，再从端点走线
@@ -1485,6 +1564,10 @@ window.__ModuleLoader__.load({
           continue;
         }
         let simplified = rdp(pts, tolerance);
+        // 磨圆一遍再收紧：像素阶梯走出来的折角会被抹掉，线看起来才是「画」出来的
+        if (smoothIters > 0) {
+          simplified = smoothPath(simplified, closed, smoothIters);
+        }
         if (simplified.length > maxPointsPerLine) {
           const stepN = Math.ceil(simplified.length / maxPointsPerLine);
           simplified = simplified.filter((_, i) => i % stepN === 0 || i === simplified.length - 1);
@@ -1494,7 +1577,7 @@ window.__ModuleLoader__.load({
         if (out.length >= maxLines) break;
       }
       const points = out.reduce((n, l) => n + l.length, 0);
-      return { paths: out, closed: closedFlags, mode: center ? 'center' : 'edge', lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
+      return { paths: out, closed: closedFlags, mode: center ? 'center' : 'edge', lines: out.length, points, dropped, tolerance, smooth: smoothIters, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
     }
 
     /** 主色聚类：真 k-means（初值取量化后占比最高的几档，10 轮迭代）。 */
@@ -1908,9 +1991,10 @@ window.__ModuleLoader__.load({
         }
         const traced = traceInk(img.data, rect.w, rect.h, {
           mode,
+          smooth: params.smooth === undefined ? 2 : params.smooth,
           threshold: params.threshold,
           tolerance: params.tolerance,
-          minLength: params.minLength,
+          minLength: params.minLength === undefined ? 16 : params.minLength,
           maxLines: params.maxLines || 160,
           maxPointsPerLine: params.maxPointsPerLine || 120,
         });
@@ -1934,6 +2018,7 @@ window.__ModuleLoader__.load({
           fills,
           palette,
           mode,
+          smooth: traced.smooth,
           inkRatio: inkRatio === null ? null : Number(inkRatio.toFixed(3)),
           lines: traced.lines,
           points: traced.points,
@@ -1957,6 +2042,8 @@ window.__ModuleLoader__.load({
         const rect = parseRectIn(params.rect, doc);
         const img = g.getImageData(rect.x, rect.y, rect.w, rect.h);
         const t = traceInk(img.data, rect.w, rect.h, {
+          mode: params.mode === 'center' ? 'center' : 'edge',
+          smooth: params.smooth,
           threshold: params.threshold,
           tolerance: params.tolerance,
           minLength: params.minLength,
@@ -3024,7 +3111,7 @@ window.__ModuleLoader__.load({
       const brushGroups = BRUSH_GROUPS.map((gid) => ({
         id: gid,
         label: t(`brushGroup.${gid}`),
-        items: BRUSHES.filter((b) => b.group === gid),
+        items: BRUSHES.filter((b) => b.group === gid).map((b) => BRUSH_BY_ID.get(b.id)),
       }));
 
       /**
@@ -4197,7 +4284,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, pathWidths, regionFills, thinning, skeletonPaths },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, pathWidths, regionFills, thinning, skeletonPaths, chaikin, smoothPath, curvePts, brushes: [...BRUSH_BY_ID.values()] },
       apply(ctx) {
         let t = (k) => k;
         try {

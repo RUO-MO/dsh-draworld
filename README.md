@@ -95,6 +95,8 @@ https://github.com/RUO-MO/dsh-draworld
 `taper=true` 时两端按 15% 长度渐细到 `minSize`（默认取笔刷自带值，0~1），形状工具不吃这一套。
 橡皮固定走圆头实心 `destination-out`，不吃笔刷参数。
 
+**渲染时曲线补点**：控制点稀疏（相邻点平均距离 >2.5px）的笔迹，先用 Catmull-Rom 补成曲线采样再落笔，压感按段线性插值。所以模型给的几十个点、人手快速拖动留下的长段，都不会画成一段段折角。
+
 模型侧同一套：`draw` 带 `brush`（32 个 id 之一，未知值回退 `round`）、`taper`、`minSize`。
 系统提示里的用法建议：描线用 `liner/gpen/ink` + taper，草稿用 `pencil/sketch`，排线用 `charcoal`，铺底用 `wash/watercolor`，厚涂用 `oil/impasto`，光晕用 `airbrush/glow`，网点才用 `halftone`。
 
@@ -154,14 +156,14 @@ https://github.com/RUO-MO/dsh-draworld
 | 动作 | 说明 |
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
-| `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`）；每根线按量出来的**原线宽**落笔，`splitLines=true` 再把粗细分到「线稿 / 粗线」两层 |
+| `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`）；描线后默认磨圆 2 遍（`smooth=0~3`）；每根线按量出来的**原线宽**落笔，`splitLines=true` 再把粗细分到「线稿 / 粗线」两层 |
 | `fix` | **自动补漏**：只看 compare 的 `topGaps` 重描最漏的几块，`target=90`、`maxRounds=3`，达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过（`skippedHoles`） |
 | `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调；区域里的洞按轮廓嵌套自动挖掉（`evenodd` 填充） |
 | `select` | 选区：`rect=[x,y,w,h]` 或 `points`（套索），之后落笔只保留选区内的点（越界会切段）；`clearSelection=true` 取消 |
 | `draw` | 一笔：稀疏控制点 + 每点压感，颜色/笔宽/不透明度/笔刷/taper 自定；`layer="线稿"` 按名落层；`shape=line/rect/ellipse` 只给两个对角点；`batches=[…]` 一次交多笔；`mirror=x/y` 同时镜像画 |
 | `view` | 取最新渲染；**`rect=[x,y,w,h]` 裁切 + `zoom=1~8` 放大 + `layer="线稿"` 只看单层**，并返回每层包围盒 `bbox` 与覆盖率 `inkPct` |
 | `ref` | 参考图导出：整张直接给原图路径，或 `rect`+`zoom` 裁一块出来，用 `read_image` 看细节 |
-| `trace` | 参考图 → 轮廓折线：返回 `paths`（画布坐标，直接当 draw 的 points），`threshold` 调深浅、`tolerance` 调概括；`mode=center` 走骨架中心线（线稿用），默认 `edge` 沿墨迹边界 |
+| `trace` | 参考图 → 轮廓折线：返回 `paths`（画布坐标，直接当 draw 的 points），`threshold` 调深浅、`tolerance` 调概括；`mode=center` 走骨架中心线（线稿用），默认 `edge` 沿墨迹边界；`smooth=0~3` 控制磨圆遍数（默认 1） |
 | `pick` | 读某点颜色与透明度（`x`、`y`，`on=ref/canvas`）：`ink=true` 说明这点在线条上 |
 | `compare` | 当前画面 vs 参考图：差分图（品红=漏画、青=多画）+ `coveragePct`、`extraPct`、`meanColorDiff`、`topGaps`（最漏的几块） |
 | `palette` | 参考图主色聚类（真 k-means，`k` 2~8）+ 每色占比 |
@@ -239,7 +241,7 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本�
 - `fill` 会按轮廓嵌套挖洞（区域里的高光、瞳孔不会被涂掉），但只在同一片连通区域里生效；种子点落在连通整片背景时会直接拒绝，提示你先有线稿或缩小 `rect`。
 - `copy` 的自动判断看墨迹占比：线稿（占比 <13%）走中心线，照片走得边界；整幅偏灰、扫描发白时可能判成照片，此时显式传 `mode="center"` 更稳。
 - `copy` 的色块也按轮廓嵌套挖洞；洞的判定是「被最小的更大闭合轮廓包住」，所以线断开、区域没闭合的地方不会被当成洞。
-- `copy` 的线宽是沿法线数连续墨点估出来的，上限 16px；极粗的块面（大片实心）会被量成很宽，此时给 `size` 或用 `splitLines` 把它单独分到「粗线」层。
+- `trace` / `copy` 的 `smooth` 会磨圆尖角：画得太顺但丢了锐角时给 0 或 1；要更顺给 3。线宽沿法线量，极粗块面会被量宽，必要时配合 `splitLines`。
 - `trace` 抽的是「墨迹边界」不是中心线：线很粗或图很糊时，描出来会略微偏外；`tolerance` 给到 2~4 通常能压成一条线。
 - 会话绑定对「打开画界之后」的请求生效；打开前发出的那一步还看不到 `paint_canvas`。
 - 界面代码改动后需要刷新一次页面才会生效；宿主代码改动需要停用再启用插件。
