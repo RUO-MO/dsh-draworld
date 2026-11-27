@@ -754,7 +754,16 @@ window.__ModuleLoader__.load({
         g.moveTo(Number(pts[0][0]), Number(pts[0][1]));
         for (let i = 1; i < pts.length; i += 1) g.lineTo(Number(pts[i][0]), Number(pts[i][1]));
         g.closePath();
-        g.fill();
+        // holes：区域里的洞（眼睛高光之类）用 evenodd 挖掉
+        if (Array.isArray(stroke.holes)) {
+          for (const hole of stroke.holes) {
+            if (!hole || hole.length < 3) continue;
+            g.moveTo(Number(hole[0][0]), Number(hole[0][1]));
+            for (let i = 1; i < hole.length; i += 1) g.lineTo(Number(hole[i][0]), Number(hole[i][1]));
+            g.closePath();
+          }
+        }
+        g.fill('evenodd');
         g.restore();
         return;
       }
@@ -1165,6 +1174,19 @@ window.__ModuleLoader__.load({
         lines.push(line);
       }
       return lines;
+    }
+
+    /** 点在多边形内（射线法）：判断轮廓嵌套用。 */
+    function pointInPolygon(x, y, pts) {
+      let inside = false;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i, i += 1) {
+        const xi = pts[i][0];
+        const yi = pts[i][1];
+        const xj = pts[j][0];
+        const yj = pts[j][1];
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi || 1e-9) + xi) inside = !inside;
+      }
+      return inside;
     }
 
     /** 多边形面积（鞋带公式），用来判断这个闭合轮廓够不够大、值不值得填。 */
@@ -1705,14 +1727,49 @@ window.__ModuleLoader__.load({
             top += 1;
           }
         }
-        // 区域边界 → 多边形（只取外轮廓，洞里不涂）
+        // 区域边界 → 多边形
         const segs = marchingSquares(region, W, H);
-        const loops = stitchSegments(segs).map((raw) => rdp(raw.map((p) => [p[0] / 2, p[1] / 2]), 1.5));
-        const polys = loops
-          .map((pts) => ({ pts, area: polygonArea(pts) }))
+        // 轮廓嵌套：偶数层是区域（要涂），奇数层是洞（evenodd 挖掉）
+        const loops = stitchSegments(segs)
+          .map((raw) => ({ pts: rdp(raw.map((p) => [p[0] / 2, p[1] / 2]), 1.5) }))
+          .map((v) => ({ ...v, area: polygonArea(v.pts) }))
           .filter((v) => v.area > 40)
           .sort((a, b) => b.area - a.area)
-          .slice(0, 4);
+          .slice(0, 40);
+        const parents = loops.map(() => -1);
+        for (let i = 0; i < loops.length; i += 1) {
+          const p0 = loops[i].pts[0];
+          let best = -1;
+          for (let j = 0; j < i; j += 1) {
+            if (loops[j].area <= loops[i].area) continue;
+            if (!pointInPolygon(p0[0], p0[1], loops[j].pts)) continue;
+            if (best === -1 || loops[j].area < loops[best].area) best = j;
+          }
+          parents[i] = best;
+        }
+        const depths = loops.map((_, i) => {
+          let d = 0;
+          let p = parents[i];
+          while (p !== -1 && d < 8) {
+            d += 1;
+            p = parents[p];
+          }
+          return d;
+        });
+        const polys = [];
+        for (let i = 0; i < loops.length; i += 1) {
+          if (depths[i] % 2 !== 0) continue;
+          const holes = loops
+            .filter((_, j) => parents[j] === i)
+            .slice(0, 10)
+            .map((h) => h.pts.map((p) => [Math.round(p[0]), Math.round(p[1])]));
+          polys.push({
+            points: loops[i].pts.map((p) => [Math.round(p[0]), Math.round(p[1])]),
+            holes,
+            area: Math.round(loops[i].area),
+          });
+          if (polys.length >= 12) break;
+        }
         // 颜色：给了就用；否则取参考图该点颜色，映射到参考图主色里最接近的一档
         let color = params.color || null;
         if (!color) {
@@ -1754,7 +1811,7 @@ window.__ModuleLoader__.load({
           seed: [sx, sy],
           area,
           color,
-          polygons: polys.map((v) => ({ points: v.pts.map((p) => [Math.round(p[0]), Math.round(p[1])]), area: Math.round(v.area) })),
+          polygons: polys,
         };
       }
 
@@ -1771,7 +1828,18 @@ window.__ModuleLoader__.load({
         drawImageLayer(g, layer.image);
         const rect = parseRectIn(params.rect, doc);
         const img = g.getImageData(rect.x, rect.y, rect.w, rect.h);
+        // 线稿墨迹占比低 → 中心线更贴原线宽；照片/色块占比高 → 沿边界
+        let mode = params.mode === 'center' || params.mode === 'edge' ? params.mode : 'auto';
+        let inkRatio = null;
+        if (mode === 'auto') {
+          const mask = inkMask(img.data, rect.w, rect.h, params.threshold);
+          let inkPx = 0;
+          for (let i = 0; i < mask.length; i += 1) inkPx += mask[i];
+          inkRatio = inkPx / (rect.w * rect.h);
+          mode = inkRatio < 0.13 ? 'center' : 'edge';
+        }
         const traced = traceInk(img.data, rect.w, rect.h, {
+          mode,
           threshold: params.threshold,
           tolerance: params.tolerance,
           minLength: params.minLength,
@@ -1791,6 +1859,8 @@ window.__ModuleLoader__.load({
           closed: traced.closed,
           fills,
           palette,
+          mode,
+          inkRatio: inkRatio === null ? null : Number(inkRatio.toFixed(3)),
           lines: traced.lines,
           points: traced.points,
           dropped: traced.dropped,
@@ -4053,7 +4123,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, regionFills, thinning, skeletonPaths },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, regionFills, thinning, skeletonPaths },
       apply(ctx) {
         let t = (k) => k;
         try {

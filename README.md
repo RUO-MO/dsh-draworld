@@ -154,9 +154,9 @@ https://github.com/RUO-MO/dsh-draworld
 | 动作 | 说明 |
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
-| `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调 |
+| `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调；`mode` 不传则自动判断参考图是线稿还是照片（回报 `mode`、`inkRatio`） |
 | `fix` | **自动补漏**：只看 compare 的 `topGaps` 重描最漏的几块，`target=90`、`maxRounds=3`，达标或没得补就停，返回每轮数字 |
-| `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调 |
+| `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调；区域里的洞按轮廓嵌套自动挖掉（`evenodd` 填充） |
 | `select` | 选区：`rect=[x,y,w,h]` 或 `points`（套索），之后落笔只保留选区内的点（越界会切段）；`clearSelection=true` 取消 |
 | `draw` | 一笔：稀疏控制点 + 每点压感，颜色/笔宽/不透明度/笔刷/taper 自定；`layer="线稿"` 按名落层；`shape=line/rect/ellipse` 只给两个对角点；`batches=[…]` 一次交多笔；`mirror=x/y` 同时镜像画 |
 | `view` | 取最新渲染；**`rect=[x,y,w,h]` 裁切 + `zoom=1~8` 放大 + `layer="线稿"` 只看单层**，并返回每层包围盒 `bbox` 与覆盖率 `inkPct` |
@@ -236,7 +236,8 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本�
 - 混合模式只有 `normal` 与 `multiply`；滤镜、液化、透视变形属于像素管线，暂不做。
 - 图层不能拖动排序、合并、复制，也不能双击改名。
 - `view` / `ref` / `pick` / `compare` / `palette` / `copy` / `fix` / `fill` 依赖界面渲染：画界面板至少打开过一次、前端在跑；没开时像素任务 5 秒超时并直说原因。
-- `fill` 只涂外轮廓，区域里的洞（例如眼睛高光）不填；种子点落在连通整片背景时会直接拒绝，提示你先有线稿或缩小 `rect`。
+- `fill` 会按轮廓嵌套挖洞（区域里的高光、瞳孔不会被涂掉），但只在同一片连通区域里生效；种子点落在连通整片背景时会直接拒绝，提示你先有线稿或缩小 `rect`。
+- `copy` 的自动判断看墨迹占比：线稿（占比 <13%）走中心线，照片走得边界；整幅偏灰、扫描发白时可能判成照片，此时显式传 `mode="center"` 更稳。
 - `trace` 抽的是「墨迹边界」不是中心线：线很粗或图很糊时，描出来会略微偏外；`tolerance` 给到 2~4 通常能压成一条线。
 - 会话绑定对「打开画界之后」的请求生效；打开前发出的那一步还看不到 `paint_canvas`。
 - 界面代码改动后需要刷新一次页面才会生效；宿主代码改动需要停用再启用插件。

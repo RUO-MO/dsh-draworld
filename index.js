@@ -253,7 +253,7 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
 - \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，并顺带跑一次 compare，直接给出覆盖率；
 - \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字。
-- \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；
+- \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
   改局部之前先设选区，就不会糊到整幅。
 - \`action=trace mode="center"\` 走骨架中心线，适合线稿/细线参考图（默认 edge 沿墨迹边界）。
@@ -642,6 +642,7 @@ class Document {
           taper: s.taper === true,
           minSize: s.minSize === undefined ? 0.3 : Math.max(0, Math.min(1, Number(s.minSize) || 0)),
           points,
+          holes: Array.isArray(s.holes) ? s.holes : undefined,
         });
       }
     }
@@ -1929,7 +1930,7 @@ export function apply(ctx, config = {}) {
         mode: {
           type: "string",
           enum: ["edge", "center"],
-          description: "trace: edge 沿墨迹边界（默认，照片/色块用）；center 取骨架中心线（线稿/细线用，描出来更贴原线宽）。",
+          description: "edge 沿墨迹边界（默认，照片/色块用）；center 取骨架中心线（线稿/细线用，描出来更贴原线宽）。copy 也认这个参数：不传则自动判断（墨迹占比 <13% 判线稿走 center，否则 edge），回报里有 mode 与 inkRatio。",
         },
         clearSelection: {
           type: "boolean",
@@ -2261,7 +2262,7 @@ export function apply(ctx, config = {}) {
             const found = docs.layer(want);
             const target = found && !found.locked && !found.image ? found : docs.addLayer(want);
             docs.append(
-              job.polygons.map((p) => ({ mode: "fill", color: job.color, size: 1, opacity: args.opacity === undefined ? 1 : args.opacity, points: p.points })),
+              job.polygons.map((p) => ({ mode: "fill", color: job.color, size: 1, opacity: args.opacity === undefined ? 1 : args.opacity, points: p.points, holes: p.holes })),
               target.id,
             );
             return {
@@ -2308,6 +2309,7 @@ export function apply(ctx, config = {}) {
               maxLines: args.maxLines,
               colors: args.colors,
               minFill: args.minFill,
+              mode: args.mode,
             }, PIXEL_TIMEOUT_MS * 3);
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
             const created = [];
@@ -2348,6 +2350,8 @@ export function apply(ctx, config = {}) {
               revision: docs.revision,
               style,
               rect: job.rect,
+              mode: job.mode || null,
+              inkRatio: job.inkRatio === undefined ? null : job.inkRatio,
               created,
               palette: job.palette,
               lines: job.lines,
