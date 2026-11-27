@@ -251,7 +251,7 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 8. 画布本身也能改：\`action=canvas width=… height=… background=#rrggbb\`；\`action=export\` 把当前渲染另存成 PNG。
 
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
-- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，每根线按量出来的原线宽落笔，并顺带跑一次 compare，直接给出覆盖率；要粗细分层加 \`splitLines=true\`；
+- \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，描线默认走三次贝塞尔拟合（长弧一条曲线走完，比磨圆更像手画），每根线按量出来的原线宽落笔，并顺带跑一次 compare，直接给出覆盖率；要粗细分层加 \`splitLines=true\`；
 - \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字；落在色块洞里（高光）的缺口会跳过，不会把高光涂掉。
 - \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；区域里的洞（高光、瞳孔）会按轮廓嵌套挖掉不涂；
 - \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
@@ -1946,6 +1946,11 @@ export function apply(ctx, config = {}) {
           type: "number",
           description: "trace / copy: 描线后磨圆几遍 0~3，默认 trace 1、copy 2。觉得线还是抖就给 3；要贴原图硬边就给 0。",
         },
+        fit: {
+          type: "boolean",
+          description: "trace / copy: 用三次贝塞尔拟合折线（copy 默认 true，trace 默认 false）。长弧会一条曲线走完，比磨圆更像手画的。",
+        },
+        fitStep: { type: "number", description: "trace / copy: 拟合后采样间距（像素），默认 3。小一点更贴原线，点也更多。" },
         style: {
           type: "string",
           enum: ["lineart", "flat", "anime"],
@@ -2343,6 +2348,8 @@ export function apply(ctx, config = {}) {
               colors: args.colors,
               minFill: args.minFill,
               smooth: args.smooth,
+              fit: args.fit === undefined ? true : args.fit === true,
+              fitStep: args.fitStep,
               mode: args.mode,
             }, PIXEL_TIMEOUT_MS * 3);
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
@@ -2411,6 +2418,7 @@ export function apply(ctx, config = {}) {
               rect: job.rect,
               mode: job.mode || null,
               smooth: job.smooth === undefined ? null : job.smooth,
+              fit: job.fit === undefined ? null : job.fit,
               inkRatio: job.inkRatio === undefined ? null : job.inkRatio,
               lineWidth: job.lineWidth === undefined ? null : job.lineWidth,
               widths: Array.isArray(job.widths) ? job.widths : null,
@@ -2499,6 +2507,8 @@ export function apply(ctx, config = {}) {
               minLength: args.minLength,
               maxLines: args.maxLines,
               smooth: args.smooth,
+              fit: args.fit === true,
+              fitStep: args.fitStep,
               mode: args.mode === "center" ? "center" : "edge",
             });
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
@@ -2512,6 +2522,7 @@ export function apply(ctx, config = {}) {
               tolerance: job.tolerance,
               threshold: job.threshold,
               smooth: job.smooth === undefined ? null : job.smooth,
+              fit: job.fit === undefined ? null : job.fit,
               paths: job.paths,
               hint: "paths 是从参考图抽出的轮廓折线（画布坐标），每段直接当 draw 的 points 用；长图可分批 batches=[…]。"
                 + "描完用 view rect+zoom 对照，再用 compare 看 coveragePct。",

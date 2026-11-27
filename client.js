@@ -1528,6 +1528,141 @@ window.__ModuleLoader__.load({
       return paths;
     }
 
+    /** 三次贝塞尔在 t 处的点。 */
+    function bezierPoint(seg, t) {
+      const p0 = seg[0];
+      const c1 = seg[1];
+      const c2 = seg[2];
+      const p1 = seg[3];
+      const mt = 1 - t;
+      const b0 = mt * mt * mt;
+      const b1 = 3 * t * mt * mt;
+      const b2 = 3 * t * t * mt;
+      const b3 = t * t * t;
+      return [
+        p0[0] * b0 + c1[0] * b1 + c2[0] * b2 + p1[0] * b3,
+        p0[1] * b0 + c1[1] * b1 + c2[1] * b2 + p1[1] * b3,
+      ];
+    }
+
+    /**
+     * 三次贝塞尔拟合（Schneider 的自动拟合思路）：把一串点拟成尽量少的曲线段。
+     * 比磨圆更根本——长弧能一条曲线走完，不再靠大量短线段凑。
+     * 返回 [[p0, c1, c2, p1], …]。
+     */
+    function fitBezier(points, tolerance) {
+      const tol = Math.max(0.2, Number(tolerance) || 1);
+      const pts = points.filter((p) => Array.isArray(p) && Number.isFinite(p[0]));
+      const segs = [];
+      if (pts.length < 2) return segs;
+      const unit = (a, b) => {
+        const dx = b[0] - a[0];
+        const dy = b[1] - a[1];
+        const n = Math.hypot(dx, dy) || 1;
+        return [dx / n, dy / n];
+      };
+      const fitOne = (p, t1, t2) => {
+        const last = p.length - 1;
+        // 弦长参数化
+        const u = [0];
+        for (let i = 1; i <= last; i += 1) {
+          u.push(u[i - 1] + (Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]) || 1e-4));
+        }
+        const total = u[last] || 1;
+        for (let i = 0; i <= last; i += 1) u[i] /= total;
+        const C = [[0, 0], [0, 0]];
+        const X = [0, 0];
+        for (let i = 0; i <= last; i += 1) {
+          const t = u[i];
+          const mt = 1 - t;
+          const b0 = mt * mt * mt;
+          const b1 = 3 * t * mt * mt;
+          const b2 = 3 * t * t * mt;
+          const b3 = t * t * t;
+          const a1 = [t1[0] * b1, t1[1] * b1];
+          const a2 = [t2[0] * b2, t2[1] * b2];
+          C[0][0] += a1[0] * a1[0] + a1[1] * a1[1];
+          C[0][1] += a1[0] * a2[0] + a1[1] * a2[1];
+          C[1][0] = C[0][1];
+          C[1][1] += a2[0] * a2[0] + a2[1] * a2[1];
+          const px = p[i][0] - (p[0][0] * (b0 + b1) + p[last][0] * (b2 + b3));
+          const py = p[i][1] - (p[0][1] * (b0 + b1) + p[last][1] * (b2 + b3));
+          X[0] += a1[0] * px + a1[1] * py;
+          X[1] += a2[0] * px + a2[1] * py;
+        }
+        const det = C[0][0] * C[1][1] - C[0][1] * C[1][0];
+        let a1;
+        let a2;
+        if (Math.abs(det) > 1e-9) {
+          a1 = (X[0] * C[1][1] - X[1] * C[0][1]) / det;
+          a2 = (C[0][0] * X[1] - C[1][0] * X[0]) / det;
+        } else {
+          a1 = 0;
+          a2 = 0;
+        }
+        const chord = Math.hypot(p[last][0] - p[0][0], p[last][1] - p[0][1]) || 1;
+        if (!(a1 > chord * 0.02)) a1 = chord / 3;
+        if (!(a2 > chord * 0.02)) a2 = chord / 3;
+        const seg = [
+          p[0],
+          [p[0][0] + t1[0] * a1, p[0][1] + t1[1] * a1],
+          [p[last][0] + t2[0] * a2, p[last][1] + t2[1] * a2],
+          p[last],
+        ];
+        // 取每段的采样误差，找最离谱的那点当切分位置
+        let maxErr = 0;
+        let maxIdx = Math.floor(last / 2);
+        for (let i = 1; i < last; i += 1) {
+          const q = bezierPoint(seg, u[i]);
+          const d = Math.hypot(q[0] - p[i][0], q[1] - p[i][1]);
+          if (d > maxErr) {
+            maxErr = d;
+            maxIdx = i;
+          }
+        }
+        return { seg, maxErr, maxIdx };
+      };
+      const fitRange = (s, e, t1, t2, depth) => {
+        const p = pts.slice(s, e + 1);
+        if (p.length === 2) {
+          const c1 = [p[0][0] + (p[1][0] - p[0][0]) / 3, p[0][1] + (p[1][1] - p[0][1]) / 3];
+          const c2 = [p[0][0] + (p[1][0] - p[0][0]) * 2 / 3, p[0][1] + (p[1][1] - p[0][1]) * 2 / 3];
+          segs.push([p[0], c1, c2, p[1]]);
+          return;
+        }
+        const r = fitOne(p, t1, t2);
+        if (r.maxErr <= tol || p.length <= 3 || depth >= 12) {
+          segs.push(r.seg);
+          return;
+        }
+        const k = s + Math.max(1, Math.min(p.length - 2, r.maxIdx));
+        const center = unit(pts[k - 1], pts[k + 1]);
+        fitRange(s, k, t1, [-center[0], -center[1]], depth + 1);
+        fitRange(k, e, [center[0], center[1]], t2, depth + 1);
+      };
+      fitRange(0, pts.length - 1, unit(pts[0], pts[1]), unit(pts[pts.length - 1], pts[pts.length - 2]), 0);
+      return segs;
+    }
+
+    /** 把拟合出的曲线段采样回点串（落笔还是用点，笔刷引擎才吃得到压感）。 */
+    function bezierSample(segs, step, cap) {
+      const out = [];
+      if (!Array.isArray(segs) || segs.length === 0) return out;
+      const max = Math.max(8, Number(cap) || 400);
+      for (const seg of segs) {
+        const len = Math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1])
+          + Math.hypot(seg[2][0] - seg[1][0], seg[2][1] - seg[1][1])
+          + Math.hypot(seg[3][0] - seg[2][0], seg[3][1] - seg[2][1]);
+        const n = Math.max(2, Math.min(64, Math.ceil(len / Math.max(1, Number(step) || 3))));
+        for (let i = out.length ? 1 : 0; i <= n; i += 1) {
+          const q = bezierPoint(seg, i / n);
+          out.push([q[0], q[1]]);
+          if (out.length >= max) return out;
+        }
+      }
+      return out;
+    }
+
     /**
      * 参考图 → 折线：掩码 → 模糊 → 轮廓 → 简化 → 过滤碎片。
      * 输出坐标是这块区域内的像素坐标（半像素精度），调用方自己加偏移。
@@ -1539,6 +1674,9 @@ window.__ModuleLoader__.load({
       const maxLines = Math.max(1, Number(opts.maxLines) || 80);
       const maxPointsPerLine = Math.max(6, Number(opts.maxPointsPerLine) || 160);
       const smoothIters = Math.max(0, Math.min(3, opts.smooth === undefined ? 1 : Number(opts.smooth) || 0));
+      const wantFit = opts.fit === true;
+      const fitStep = Math.max(1.5, Number(opts.fitStep) || 3);
+      const tolFit = Math.max(0.3, Number(opts.fitTolerance) || tolerance * 0.9);
       let lines;
       if (center) {
         // 中心线：先细化成 1px 骨架，再从端点走线
@@ -1564,8 +1702,13 @@ window.__ModuleLoader__.load({
           continue;
         }
         let simplified = rdp(pts, tolerance);
-        // 磨圆一遍再收紧：像素阶梯走出来的折角会被抹掉，线看起来才是「画」出来的
-        if (smoothIters > 0) {
+        // 贝塞尔拟合优先：长弧一条曲线走完，比磨圆更「像手画的」
+        if (wantFit && simplified.length >= 3) {
+          const segsFit = fitBezier(simplified, tolFit);
+          const sampled = bezierSample(segsFit, fitStep, maxPointsPerLine * 2);
+          if (sampled.length >= 2) simplified = sampled;
+        } else if (smoothIters > 0) {
+          // 磨圆一遍再收紧：像素阶梯走出来的折角会被抹掉，线看起来才是「画」出来的
           simplified = smoothPath(simplified, closed, smoothIters);
         }
         if (simplified.length > maxPointsPerLine) {
@@ -1577,7 +1720,7 @@ window.__ModuleLoader__.load({
         if (out.length >= maxLines) break;
       }
       const points = out.reduce((n, l) => n + l.length, 0);
-      return { paths: out, closed: closedFlags, mode: center ? 'center' : 'edge', lines: out.length, points, dropped, tolerance, smooth: smoothIters, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
+      return { paths: out, closed: closedFlags, mode: center ? 'center' : 'edge', lines: out.length, points, dropped, tolerance, smooth: smoothIters, fit: wantFit, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
     }
 
     /** 主色聚类：真 k-means（初值取量化后占比最高的几档，10 轮迭代）。 */
@@ -1992,6 +2135,8 @@ window.__ModuleLoader__.load({
         const traced = traceInk(img.data, rect.w, rect.h, {
           mode,
           smooth: params.smooth === undefined ? 2 : params.smooth,
+          fit: params.fit === undefined ? true : params.fit,
+          fitStep: params.fitStep || 3,
           threshold: params.threshold,
           tolerance: params.tolerance,
           minLength: params.minLength === undefined ? 16 : params.minLength,
@@ -2019,6 +2164,7 @@ window.__ModuleLoader__.load({
           palette,
           mode,
           smooth: traced.smooth,
+          fit: traced.fit,
           inkRatio: inkRatio === null ? null : Number(inkRatio.toFixed(3)),
           lines: traced.lines,
           points: traced.points,
@@ -2044,6 +2190,8 @@ window.__ModuleLoader__.load({
         const t = traceInk(img.data, rect.w, rect.h, {
           mode: params.mode === 'center' ? 'center' : 'edge',
           smooth: params.smooth,
+          fit: params.fit === true,
+          fitStep: params.fitStep,
           threshold: params.threshold,
           tolerance: params.tolerance,
           minLength: params.minLength,
@@ -2051,7 +2199,7 @@ window.__ModuleLoader__.load({
         });
         // 区域内的坐标 → 画布坐标，模型可以直接喂 draw
         const paths = t.paths.map((line) => line.map((p) => [Math.round(rect.x + p[0]), Math.round(rect.y + p[1])]));
-        return { ok: true, rect, paths, lines: t.lines, points: t.points, dropped: t.dropped, tolerance: t.tolerance, threshold: t.threshold };
+        return { ok: true, rect, paths, lines: t.lines, points: t.points, dropped: t.dropped, tolerance: t.tolerance, smooth: t.smooth, fit: t.fit, threshold: t.threshold };
       }
 
       if (kind === 'palette') {
@@ -4284,7 +4432,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, pathWidths, regionFills, thinning, skeletonPaths, chaikin, smoothPath, curvePts, brushes: [...BRUSH_BY_ID.values()] },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, pointInPolygon, pathWidths, regionFills, thinning, skeletonPaths, chaikin, smoothPath, curvePts, fitBezier, bezierSample, bezierPoint, brushes: [...BRUSH_BY_ID.values()] },
       apply(ctx) {
         let t = (k) => k;
         try {
