@@ -16,14 +16,31 @@
 
 ## 安装
 
-插件是本地目录安装，没有第三方依赖（纯 ESM，渲染在浏览器里做）。
+插件是本地目录安装，没有第三方依赖（纯 ESM，渲染在浏览器里做）。两种装法：
 
-1. 下载 [最新 Release](https://github.com/RUO-MO/dsh-draworld/releases) 的 zip 解压，或直接 `git clone https://github.com/RUO-MO/dsh-draworld.git`。
-2. 在 DeepSeek Harness 的**插件管理**里添加这个目录（和本地开发时的安装方式一致）。
-3. 首次装好或宿主代码改动后，把插件**停用再启用**（或重启 DSH）；只改界面代码的话 `Ctrl+R` 刷新页面即可。
-4. 想确认装的是新版本：右栏画布上不该出现「宿主版本过旧」的红色提示；打开画界后访问 `http://127.0.0.1:<DSH端口>/canvas-api/diagnostics`，`api=3`、`scope.mode=session`。
+**A. 从仓库地址装（推荐，便于更新）**
 
-> 插件管理按 `package.json` 的 `version` 判断是否需要更新。本地目录装了插件、文件改了但版本号没动，它不认——升级请先改版本号。
+在 DeepSeek Harness 的插件管理里填安装地址，任选其一：
+
+```
+github:RUO-MO/dsh-draworld
+https://github.com/RUO-MO/dsh-draworld
+```
+
+插件管理器会先用 `git ls-remote` 检查仓库连通性，再用 pnpm 装源码（仓库无构建脚本，`--ignore-scripts` 即可）。
+需要本机有 `git`、能访问 `github.com`；**用 https，不要用 ssh**——很多网络下 22 端口被拒。
+
+**B. 从本地目录装**
+
+1. 下载 [最新 Release](https://github.com/RUO-MO/dsh-draworld/releases) 的 zip 解压，或 `git clone https://github.com/RUO-MO/dsh-draworld.git`。
+2. 插件管理里添加这个目录。
+
+装完都要**停用再启用**（宿主代码生效）；只改界面代码时 `Ctrl+R` 刷新页面即可。
+想确认装的是新版本：打开画界后访问 `http://127.0.0.1:<DSH端口>/canvas-api/diagnostics`，`api=3`、`scope.mode=session`。
+
+> **更新**：GitHub Release 只是下载页，不会向已装用户推送。用方式 A 装的，用同一条地址再装一次（或 `pnpm update`）就会拉到最新提交；用方式 B 装的，需要自己替换目录里的文件。插件管理器的「可更新」角标只覆盖官方目录条目，自建仓库不会显示。
+
+> 插件管理按 `package.json` 的 `version` 判断版本。本地目录装了插件、文件改了但版本号没动，它不认——升级请先改版本号。
 
 ## 界面
 
