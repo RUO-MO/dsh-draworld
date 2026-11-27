@@ -169,6 +169,16 @@ window.__ModuleLoader__.load({
         updateApplying: '更新中…',
         updateDone: '已触发更新，重启 DSH 后生效',
         updateFail: '更新没成',
+        versionCard: '版本',
+        versionCurrent: '当前',
+        versionLatest: '最新',
+        versionNever: '还没查过',
+        versionUpToDate: '已是最新',
+        versionCheckNow: '检查更新',
+        versionChecking: '检查中…',
+        versionOff: '自动检查已关闭',
+        versionCheckFail: '检查失败',
+        versionCheckedAt: '检查于',
         zoomFit: '适应',
         zoomActual: '1:1',
         panHint: '空格拖动/中键拖动平移，滚轮缩放',
@@ -308,6 +318,16 @@ window.__ModuleLoader__.load({
         updateApplying: 'Updating…',
         updateDone: 'Update triggered: restart DSH to apply',
         updateFail: 'Update failed',
+        versionCard: 'Version',
+        versionCurrent: 'current',
+        versionLatest: 'latest',
+        versionNever: 'not checked yet',
+        versionUpToDate: 'Up to date',
+        versionCheckNow: 'Check now',
+        versionChecking: 'Checking…',
+        versionOff: 'Auto check off',
+        versionCheckFail: 'Check failed',
+        versionCheckedAt: 'checked',
         zoomFit: 'Fit',
         zoomActual: '1:1',
         panHint: 'Space or middle-drag to pan, wheel to zoom',
@@ -2521,6 +2541,29 @@ window.__ModuleLoader__.load({
           setApplying(false);
         }
       };
+
+      /** 手动查一次（/update?force=1），让「检查更新」这个动作有个看得见的结果。 */
+      const [checking, setChecking] = React.useState(false);
+      const [checkNote, setCheckNote] = React.useState('');
+      const [localVer, setLocalVer] = React.useState('');
+      const checkUpdateNow = async () => {
+        if (checking) return;
+        setChecking(true);
+        setCheckNote('');
+        try {
+          const r = await fetch(`${API}/update?force=1`, { cache: 'no-store' });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok || body.ok === false) {
+            setCheckNote(`${t('versionCheckFail')}：${body.error || r.status}`);
+            return;
+          }
+          setUpdateInfo({ ...body, enabled: body.enabled !== false });
+        } catch (err) {
+          setCheckNote(`${t('versionCheckFail')}：${(err && err.message) || err}`);
+        } finally {
+          setChecking(false);
+        }
+      };
       const [meta, setMeta] = React.useState({ strokes: 0, redo: 0, layers: [], activeLayer: null, background: '#ffffff', width: 1024, height: 1024 });
       const viewportRef = React.useRef(null);
       const viewRef = React.useRef({ scale: 1, x: 0, y: 0 });
@@ -2746,6 +2789,7 @@ window.__ModuleLoader__.load({
             // 宿主有没有 32 支笔刷：旧进程只认 5 支，落笔后笔刷会被丢掉，重画成圆头
             setStaleHost(!(Number(body.brushes) >= BRUSHES.length));
             setUpdateInfo(body.update || null);
+            if (body.version) setLocalVer(String(body.version));
             docRef.current = body.doc;
             await ensureImages(body.doc);
             if (!alive) return;
@@ -3750,6 +3794,74 @@ window.__ModuleLoader__.load({
               ),
             ), `rev ${revision}`),
 
+            // B3：版本（自检结果一直看得见，不然「已是最新」跟「没查」没法区分）
+            card(t('versionCard'), h(React.Fragment, null,
+              h('div', {
+                style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11.5, marginBottom: 3 },
+              },
+                h('span', { style: { color: 'var(--dsw-alias-label-tertiary, inherit)' } }, t('versionCurrent')),
+                h('span', {
+                  style: { fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
+                }, localVer || (updateInfo && updateInfo.local) || '—'),
+                h('span', {
+                  style: { marginLeft: 'auto', fontSize: 11 },
+                },
+                  updateInfo
+                    ? (updateInfo.enabled === false
+                      ? t('versionOff')
+                      : updateInfo.error
+                        ? `${t('versionCheckFail')}`
+                        : updateInfo.hasUpdate
+                          ? `${t('updateTip')} ${updateInfo.latest}`
+                          : t('versionUpToDate'))
+                    : t('versionNever')),
+              ),
+              updateInfo && updateInfo.latest && !updateInfo.error
+                ? h('div', {
+                  style: {
+                    fontSize: 11,
+                    color: 'var(--dsw-alias-label-tertiary, inherit)',
+                    marginBottom: 6,
+                    fontVariantNumeric: 'tabular-nums',
+                  },
+                }, `${t('versionLatest')} ${updateInfo.latest}${updateInfo.checkedAt ? ` · ${t('versionCheckedAt')} ${new Date(updateInfo.checkedAt).toLocaleTimeString()}` : ''}`)
+                : null,
+              h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                h('button', {
+                  type: 'button',
+                  style: { ...pill, flex: '1 1 auto', padding: '5px 8px', opacity: checking ? 0.6 : 1 },
+                  disabled: checking,
+                  onClick: checkUpdateNow,
+                }, checking ? t('versionChecking') : t('versionCheckNow')),
+                updateInfo && updateInfo.hasUpdate
+                  ? h('button', {
+                    type: 'button',
+                    style: {
+                      ...pill,
+                      flex: '1 1 auto',
+                      padding: '5px 8px',
+                      borderColor: 'var(--dsw-alias-brand-primary, #4c8bf5)',
+                      color: 'var(--dsw-alias-brand-primary, #4c8bf5)',
+                      fontWeight: 600,
+                      opacity: applying ? 0.7 : 1,
+                    },
+                    disabled: applying,
+                    onClick: applyUpdate,
+                  }, applying ? t('updateApplying') : t('updateApply'))
+                  : null,
+              ),
+              checkNote
+                ? h('div', {
+                  style: { fontSize: 11, paddingTop: 5, color: 'var(--dsw-alias-label-error, #e5484d)' },
+                }, checkNote)
+                : null,
+              updateInfo && updateInfo.error
+                ? h('div', {
+                  style: { fontSize: 10.5, paddingTop: 5, color: 'var(--dsw-alias-label-tertiary, inherit)', wordBreak: 'break-all' },
+                }, String(updateInfo.error).slice(0, 160))
+                : null,
+            ), updateInfo && updateInfo.enabled === false ? t('versionOff') : undefined),
+
             h('div', {
               style: {
                 padding: '2px 2px 0',
@@ -4065,7 +4177,7 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: { ...barStyle, borderBottom: 'none', paddingTop: 0 } },
           opsCtl,
-          h('span', { style: { marginLeft: 'auto', opacity: 0.45 } }, `rev ${revision}`),
+          h('span', { style: { marginLeft: 'auto', opacity: 0.45 } }, `rev ${revision}${localVer ? ` · v${localVer}` : ''}`),
         ),
         h('div', {
           style: {
