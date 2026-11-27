@@ -1,6 +1,6 @@
 {
   "name": "@xenra/dsh-draworld",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "private": true,
   "description": "星染世界：DeepSeek Harness 里的一块真画布: a right-sidebar canvas tab plus a paint_canvas tool, so the model and the human draw on the same document.",
   "type": "module",

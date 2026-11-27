@@ -149,17 +149,19 @@ https://github.com/RUO-MO/dsh-draworld
 
 ## 模型接口
 
-`paint_canvas` 一个工具，`action` 23 个：
+`paint_canvas` 一个工具，`action` 22 个：
 
 | 动作 | 说明 |
 |---|---|
 | `doc` | 看尺寸、图层、笔迹数、颜色、内容范围、版本；图层带 `image` 就是图片层 |
 | `copy` | **一键复刻**：`style=lineart/flat/anime`，自动抽轮廓 + 区域配色，建「色块 / 线稿」两层，并顺带跑 compare 返回覆盖率；`colors`、`minFill` 可调 |
 | `fix` | **自动补漏**：只看 compare 的 `topGaps` 重描最漏的几块，`target=90`、`maxRounds=3`，达标或没得补就停，返回每轮数字 |
+| `fill` | **点一下填色**：`x`、`y` 是区域内的种子点，边界取现有笔迹，颜色默认取参考图该点并映射到主色；`color`、`rect`、`fillLayer` 可调 |
+| `select` | 选区：`rect=[x,y,w,h]` 或 `points`（套索），之后落笔只保留选区内的点（越界会切段）；`clearSelection=true` 取消 |
 | `draw` | 一笔：稀疏控制点 + 每点压感，颜色/笔宽/不透明度/笔刷/taper 自定；`layer="线稿"` 按名落层；`shape=line/rect/ellipse` 只给两个对角点；`batches=[…]` 一次交多笔；`mirror=x/y` 同时镜像画 |
 | `view` | 取最新渲染；**`rect=[x,y,w,h]` 裁切 + `zoom=1~8` 放大 + `layer="线稿"` 只看单层**，并返回每层包围盒 `bbox` 与覆盖率 `inkPct` |
 | `ref` | 参考图导出：整张直接给原图路径，或 `rect`+`zoom` 裁一块出来，用 `read_image` 看细节 |
-| `trace` | 参考图 → 轮廓折线：返回 `paths`（画布坐标，直接当 draw 的 points），`threshold` 调深浅、`tolerance` 调概括；已经过 3×3 模糊 + RDP 简化，细线不会碎成双线 |
+| `trace` | 参考图 → 轮廓折线：返回 `paths`（画布坐标，直接当 draw 的 points），`threshold` 调深浅、`tolerance` 调概括；`mode=center` 走骨架中心线（线稿用），默认 `edge` 沿墨迹边界 |
 | `pick` | 读某点颜色与透明度（`x`、`y`，`on=ref/canvas`）：`ink=true` 说明这点在线条上 |
 | `compare` | 当前画面 vs 参考图：差分图（品红=漏画、青=多画）+ `coveragePct`、`extraPct`、`meanColorDiff`、`topGaps`（最漏的几块） |
 | `palette` | 参考图主色聚类（真 k-means，`k` 2~8）+ 每色占比 |
@@ -173,6 +175,8 @@ https://github.com/RUO-MO/dsh-draworld
 | `clear` | 清空整幅；带 `layer` 只清那层（`all`/`*` 等同整幅） |
 
 **复刻一张图**的闭环：最省模型能力的是 `copy` → `fix` 两条命令；想手工精修再按 `ref` 看细节 → `palette` 定配色 → `trace` 抽轮廓 → `pick` 确认某点在不在线上 → `draw`（长线用 `batches`）→ `view layer=… rect=… zoom=2` 看自己那块 → `compare` 看差多少（`coveragePct` 往 90+ 推、`extraPct` 压下去）→ 收尾前 `snapshot` 兜底。整段流程与协议文本都写进了会话提示词，模型看得到。
+
+**改局部别糊整幅**：先 `select` 框住范围（`rect` 或套索 `points`），再 `draw` / `fill`，越界点会被裁掉；改完 `select clearSelection=true`。选区存在 `doc.json` 的 `selection` 字段里，会跟着文档走。
 
 **像素任务**：裁切、取色、差分、主色这些活在前端算——浏览器早就把参考图解码进 `<canvas>` 了，宿主只搬运，不引 `@napi-rs/canvas` 这类依赖。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。超时 5 秒，报错会直说「需要在浏览器里打开画界面板」。
 
@@ -228,10 +232,11 @@ GET  /canvas-api/diagnostics    工具/路由/文档/绑定/任务队列/版本�
 
 ## 已知限制
 
-- 选区（矩形/套索/魔棒）还没做，笔迹不能裁切或限制在选区内。
+- 选区只有矩形与套索，没有魔棒；选区没有可视化的虚线框（只生效在落笔裁切上），`fill` 的边界也只认笔迹、不认选区。
 - 混合模式只有 `normal` 与 `multiply`；滤镜、液化、透视变形属于像素管线，暂不做。
 - 图层不能拖动排序、合并、复制，也不能双击改名。
-- `view` / `ref` / `pick` / `compare` / `palette` 依赖界面渲染：画界面板至少打开过一次、前端在跑；没开时像素任务 5 秒超时并直说原因。
+- `view` / `ref` / `pick` / `compare` / `palette` / `copy` / `fix` / `fill` 依赖界面渲染：画界面板至少打开过一次、前端在跑；没开时像素任务 5 秒超时并直说原因。
+- `fill` 只涂外轮廓，区域里的洞（例如眼睛高光）不填；种子点落在连通整片背景时会直接拒绝，提示你先有线稿或缩小 `rect`。
 - `trace` 抽的是「墨迹边界」不是中心线：线很粗或图很糊时，描出来会略微偏外；`tolerance` 给到 2~4 通常能压成一条线。
 - 会话绑定对「打开画界之后」的请求生效；打开前发出的那一步还看不到 `paint_canvas`。
 - 界面代码改动后需要刷新一次页面才会生效；宿主代码改动需要停用再启用插件。

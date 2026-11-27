@@ -1255,17 +1255,130 @@ window.__ModuleLoader__.load({
       return fills;
     }
 
+    /** Zhang-Suen 细化：把线压成 1px 骨架，用于「中心线」描线。 */
+    function thinning(mask, w, h) {
+      const img = Uint8Array.from(mask);
+      const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h ? 0 : img[y * w + x]);
+      let changed = true;
+      let guard = 0;
+      while (changed && guard < 40) {
+        guard += 1;
+        changed = false;
+        for (let step = 0; step < 2; step += 1) {
+          const del = [];
+          for (let y = 1; y < h - 1; y += 1) {
+            for (let x = 1; x < w - 1; x += 1) {
+              if (!img[y * w + x]) continue;
+              const p2 = at(x, y - 1);
+              const p3 = at(x + 1, y - 1);
+              const p4 = at(x + 1, y);
+              const p5 = at(x + 1, y + 1);
+              const p6 = at(x, y + 1);
+              const p7 = at(x - 1, y + 1);
+              const p8 = at(x - 1, y);
+              const p9 = at(x - 1, y - 1);
+              const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+              if (B < 2 || B > 6) continue;
+              const seq = [p2, p3, p4, p5, p6, p7, p8, p9, p2];
+              let a = 0;
+              for (let i = 0; i < 8; i += 1) if (seq[i] === 0 && seq[i + 1] === 1) a += 1;
+              if (a !== 1) continue;
+              if (step === 0) {
+                if (p2 * p4 * p6 !== 0) continue;
+                if (p4 * p6 * p8 !== 0) continue;
+              } else {
+                if (p2 * p4 * p8 !== 0) continue;
+                if (p2 * p6 * p8 !== 0) continue;
+              }
+              del.push(y * w + x);
+            }
+          }
+          if (del.length > 0) {
+            changed = true;
+            for (const p of del) img[p] = 0;
+          }
+        }
+      }
+      return img;
+    }
+
+    /** 骨架 → 折线：从端点走一遍，剩下的环再走一遍。 */
+    function skeletonPaths(skel, w, h) {
+      const deg = new Uint8Array(w * h);
+      const N8 = [[-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0]];
+      for (let y = 0; y < h; y += 1) {
+        for (let x = 0; x < w; x += 1) {
+          if (!skel[y * w + x]) continue;
+          let d = 0;
+          for (const [dx, dy] of N8) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            if (skel[ny * w + nx]) d += 1;
+          }
+          deg[y * w + x] = d;
+        }
+      }
+      const visited = new Uint8Array(w * h);
+      const paths = [];
+      const walk = (sx, sy) => {
+        const path = [[sx, sy]];
+        visited[sy * w + sx] = 1;
+        let x = sx;
+        let y = sy;
+        for (;;) {
+          let next = null;
+          for (const [dx, dy] of N8) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const q = ny * w + nx;
+            if (skel[q] && !visited[q]) {
+              next = [nx, ny];
+              break;
+            }
+          }
+          if (!next) break;
+          visited[next[1] * w + next[0]] = 1;
+          path.push(next);
+          x = next[0];
+          y = next[1];
+        }
+        return path;
+      };
+      for (let y = 0; y < h; y += 1) {
+        for (let x = 0; x < w; x += 1) {
+          const p = y * w + x;
+          if (skel[p] && deg[p] === 1 && !visited[p]) paths.push(walk(x, y));
+        }
+      }
+      for (let y = 0; y < h; y += 1) {
+        for (let x = 0; x < w; x += 1) {
+          const p = y * w + x;
+          if (skel[p] && !visited[p]) paths.push(walk(x, y));
+        }
+      }
+      return paths;
+    }
+
     /**
      * 参考图 → 折线：掩码 → 模糊 → 轮廓 → 简化 → 过滤碎片。
      * 输出坐标是这块区域内的像素坐标（半像素精度），调用方自己加偏移。
      */
     function traceInk(imageData, w, h, opts = {}) {
-      const tolerance = Math.max(0.5, Number(opts.tolerance) || 2.5);
+      const center = opts.mode === 'center';
+      const tolerance = Math.max(0.5, Number(opts.tolerance) || (center ? 1.2 : 2.5));
       const minLength = Math.max(2, Number(opts.minLength) || 12);
       const maxLines = Math.max(1, Number(opts.maxLines) || 80);
       const maxPointsPerLine = Math.max(6, Number(opts.maxPointsPerLine) || 160);
-      const mask = blurMask(inkMask(imageData, w, h, opts.threshold), w, h);
-      const lines = stitchSegments(marchingSquares(mask, w, h));
+      let lines;
+      if (center) {
+        // 中心线：先细化成 1px 骨架，再从端点走线
+        const skel = thinning(inkMask(imageData, w, h, opts.threshold), w, h);
+        lines = skeletonPaths(skel, w, h).map((pts) => pts.map((p) => [p[0] * 2, p[1] * 2]));
+      } else {
+        lines = stitchSegments(marchingSquares(blurMask(inkMask(imageData, w, h, opts.threshold), w, h), w, h));
+      }
       const out = [];
       const closedFlags = [];
       let dropped = 0;
@@ -1292,7 +1405,7 @@ window.__ModuleLoader__.load({
         if (out.length >= maxLines) break;
       }
       const points = out.reduce((n, l) => n + l.length, 0);
-      return { paths: out, closed: closedFlags, lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
+      return { paths: out, closed: closedFlags, mode: center ? 'center' : 'edge', lines: out.length, points, dropped, tolerance, threshold: opts.threshold === undefined ? 0.45 : Number(opts.threshold) };
     }
 
     /** 主色聚类：真 k-means（初值取量化后占比最高的几档，10 轮迭代）。 */
@@ -1535,6 +1648,114 @@ window.__ModuleLoader__.load({
           topGaps: gaps,
         };
         return { ok: true, dataUrl: diff.toDataURL('image/png'), rect, metrics };
+      }
+
+      if (kind === 'fill') {
+        const W = doc.width || 1024;
+        const H = doc.height || 1024;
+        const rect = parseRectIn(params.rect || {}, doc);
+        const sx = Math.round(Number(params.x));
+        const sy = Math.round(Number(params.y));
+        if (!Number.isFinite(sx) || !Number.isFinite(sy) || sx < 0 || sy < 0 || sx >= W || sy >= H) {
+          throw new Error('fill 的种子点超出画布');
+        }
+        // 边界只认笔迹（不含已填的色块），不然第二次填色会被自己的色块挡住
+        const barrierDoc = {
+          ...docWithoutImages(doc),
+          layers: layersOf(doc).map((l) => ({
+            ...l,
+            image: null,
+            strokes: (l.strokes || []).filter((s) => s.mode !== 'fill'),
+          })),
+        };
+        const lineCan = surface(W, H);
+        renderDoc(lineCan, barrierDoc, { withBackground: false });
+        const lineData = lineCan.getContext('2d').getImageData(0, 0, W, H).data;
+        const barrier = new Uint8Array(W * H);
+        for (let i = 0, p = 0; i < lineData.length; i += 4, p += 1) {
+          if (lineData[i + 3] > 24) barrier[p] = 1;
+        }
+        const seed = sy * W + sx;
+        if (barrier[seed]) throw new Error('种子点落在线上：给一个区域内部的点（配合 pick 找空白）');
+        // 泛洪：四连通，限定在 rect 内
+        const region = new Uint8Array(W * H);
+        const stack = new Int32Array(W * H);
+        let top = 0;
+        stack[top] = seed;
+        top += 1;
+        region[seed] = 1;
+        let area = 0;
+        const inRect = (x, y) => x >= rect.x && y >= rect.y && x < rect.x + rect.w && y < rect.y + rect.h;
+        while (top > 0) {
+          top -= 1;
+          const p = stack[top];
+          area += 1;
+          if (area > W * H * 0.62) throw new Error('这块没被线围住（填下去会把整片背景都涂了）：先有线稿，或给 rect 缩小范围');
+          const x = p % W;
+          const y = (p - x) / W;
+          const cand = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+          for (const [nx, ny] of cand) {
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            if (!inRect(nx, ny)) continue;
+            const q = ny * W + nx;
+            if (region[q] || barrier[q]) continue;
+            region[q] = 1;
+            if (top >= stack.length) break;
+            stack[top] = q;
+            top += 1;
+          }
+        }
+        // 区域边界 → 多边形（只取外轮廓，洞里不涂）
+        const segs = marchingSquares(region, W, H);
+        const loops = stitchSegments(segs).map((raw) => rdp(raw.map((p) => [p[0] / 2, p[1] / 2]), 1.5));
+        const polys = loops
+          .map((pts) => ({ pts, area: polygonArea(pts) }))
+          .filter((v) => v.area > 40)
+          .sort((a, b) => b.area - a.area)
+          .slice(0, 4);
+        // 颜色：给了就用；否则取参考图该点颜色，映射到参考图主色里最接近的一档
+        let color = params.color || null;
+        if (!color) {
+          const ref = refLayerOf(doc);
+          if (ref) {
+            const refCan = surface(W, H);
+            const rg = refCan.getContext('2d');
+            rg.clearRect(0, 0, W, H);
+            drawImageLayer(rg, ref.image);
+            const refData = rg.getImageData(0, 0, W, H).data;
+            const sxp = refData[seed * 4 + 3] > 16
+              ? [refData[seed * 4], refData[seed * 4 + 1], refData[seed * 4 + 2]]
+              : [255, 255, 255];
+            let palette = [];
+            try {
+              palette = kmeansColors(refData, 6, 8);
+            } catch {
+              palette = [];
+            }
+            let best = null;
+            let bestD = Infinity;
+            for (const c of palette) {
+              const d = (c.rgb[0] - sxp[0]) ** 2 + (c.rgb[1] - sxp[1]) ** 2 + (c.rgb[2] - sxp[2]) ** 2;
+              if (d < bestD) {
+                bestD = d;
+                best = c;
+              }
+            }
+            color = best ? best.hex : toHex(sxp[0], sxp[1], sxp[2]);
+          } else {
+            const comp = surface(W, H);
+            renderDoc(comp, doc, { withBackground: true });
+            const px = comp.getContext('2d').getImageData(sx, sy, 1, 1).data;
+            color = toHex(px[0], px[1], px[2]);
+          }
+        }
+        return {
+          ok: true,
+          seed: [sx, sy],
+          area,
+          color,
+          polygons: polys.map((v) => ({ points: v.pts.map((p) => [Math.round(p[0]), Math.round(p[1])]), area: Math.round(v.area) })),
+        };
       }
 
       if (kind === 'copy') {
@@ -3832,7 +4053,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs'],
       // 纯算法露出，供离线自测（不影响装载）
-      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, regionFills },
+      __pixel: { inkMask, blurMask, rdp, marchingSquares, stitchSegments, traceInk, kmeansColors, polygonArea, regionFills, thinning, skeletonPaths },
       apply(ctx) {
         let t = (k) => k;
         try {

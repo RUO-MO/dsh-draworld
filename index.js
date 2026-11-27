@@ -188,6 +188,27 @@ function migrateDoc(parsed = {}) {
     ? parsed.redo.filter((entry) => entry && entry.stroke).slice(-200)
     : [];
 
+  // 选区：有的文档没有这个字段；不合法就当没有选区
+  let selection = null;
+  if (parsed.selection && typeof parsed.selection === "object") {
+    const kind = parsed.selection.type === "lasso" ? "lasso" : "rect";
+    if (kind === "rect") {
+      const r = parsed.selection.rect || {};
+      const x = Math.max(0, Math.round(Number(r.x) || 0));
+      const y = Math.max(0, Math.round(Number(r.y) || 0));
+      const w = Math.min(width - x, Math.max(1, Math.round(Number(r.w) || width)));
+      const h = Math.min(height - y, Math.max(1, Math.round(Number(r.h) || height)));
+      selection = { type: "rect", rect: { x, y, w, h } };
+    } else if (Array.isArray(parsed.selection.points) && parsed.selection.points.length >= 3) {
+      selection = {
+        type: "lasso",
+        points: parsed.selection.points
+          .map((p) => [Math.round(Number(p[0])), Math.round(Number(p[1]))])
+          .filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1])),
+      };
+    }
+  }
+
   return {
     version: 2,
     width,
@@ -197,6 +218,7 @@ function migrateDoc(parsed = {}) {
     seq: counter,
     layers,
     redo,
+    selection,
   };
 }
 
@@ -231,6 +253,10 @@ const PROTOCOL = `你可以用 \`paint_canvas\` 在界面里的一块真画布�
 **最省事的复刻就两条命令**（不需要自己估坐标、算配色、找缺口）：
 - \`action=copy style=anime\`（或 lineart / flat）：自动抽轮廓、按区域配主色、建「色块 / 线稿」两层，并顺带跑一次 compare，直接给出覆盖率；
 - \`action=fix target=90 maxRounds=3\`：只看最漏的几块自动补描，到达标或没得补就停，返回每轮数字。
+- \`action=fill x=… y=…\`：点一片区域就按 palette 填色（边界来自已有笔迹，也能手动给 color），不用一笔笔涂；
+- \`action=select rect=[x,y,w,h]\` 或 \`points=[[x,y]…]\`（套索）把落笔限制在选区里，\`clearSelection=true\` 取消；
+  改局部之前先设选区，就不会糊到整幅。
+- \`action=trace mode="center"\` 走骨架中心线，适合线稿/细线参考图（默认 edge 沿墨迹边界）。
 
 **复刻一张图**照这个闭环走，不要凭缩略图估坐标：
 - \`action=ref rect=[x,y,w,h] zoom=2\` → read_image 看参考图那块细节；整张就用 \`action=ref\`（返回原图路径）。
@@ -596,25 +622,47 @@ class Document {
   append(strokes, layerRef) {
     const layer = layerRef ? this.ensureLayer(layerRef) : this.active();
     if (layer.locked === true) throw new Error(`图层「${layer.name}」被锁定，画不上去；要动它先 action=layer layerOp=set locked=false`);
+    const sel = this.doc.selection || null;
+    let added = 0;
     for (const s of strokes) {
-      this.doc.seq += 1;
-      layer.strokes.push({
-        id: `s${this.doc.seq}`,
-        seq: this.doc.seq,
-        color: s.color || "#111111",
-        size: Number(s.size) || 8,
-        opacity: s.opacity === undefined ? 1 : Number(s.opacity),
-        mode: s.mode === "eraser" ? "eraser" : (s.mode === "fill" ? "fill" : "brush"),
-        brush: BRUSH_IDS.includes(s.brush) ? s.brush : "round",
-        taper: s.taper === true,
-        minSize: s.minSize === undefined ? 0.3 : Math.max(0, Math.min(1, Number(s.minSize) || 0)),
-        points: s.points,
-      });
+      // 有选区就只保留框内的点，一笔越界会被切成几段
+      const parts = sel && s.mode !== "fill" ? clipPoints(s.points || [], sel) : [s.points];
+      for (const points of parts) {
+        if (!points || points.length < 2) continue;
+        this.doc.seq += 1;
+        added += 1;
+        layer.strokes.push({
+          id: `s${this.doc.seq}`,
+          seq: this.doc.seq,
+          color: s.color || "#111111",
+          size: Number(s.size) || 8,
+          opacity: s.opacity === undefined ? 1 : Number(s.opacity),
+          mode: s.mode === "eraser" ? "eraser" : (s.mode === "fill" ? "fill" : "brush"),
+          brush: BRUSH_IDS.includes(s.brush) ? s.brush : "round",
+          taper: s.taper === true,
+          minSize: s.minSize === undefined ? 0.3 : Math.max(0, Math.min(1, Number(s.minSize) || 0)),
+          points,
+        });
+      }
     }
     this.doc.redo = [];
+    this.lastAdded = added;
     this.bump();
     return layer;
   }
+
+  /** 设/清选区：rect 或 lasso；不给就是全画布（等于清掉）。 */
+  setSelection(sel) {
+    if (!sel) {
+      this.doc.selection = null;
+      this.bump();
+      return null;
+    }
+    this.doc.selection = sel;
+    this.bump();
+    return sel;
+  }
+
 
   /** 清空：给层就只清那层，不给就整幅清空。 */
   clear(layerRef) {
@@ -756,6 +804,7 @@ class Document {
       colors: [...colors].slice(0, 12),
       bounds: this.bounds(),
       layers,
+      selection: this.doc.selection || null,
       redo: (this.doc.redo || []).length,
       preview: existsSync(this.preview) ? this.preview : null,
       previewAlpha: existsSync(this.previewAlpha) ? this.previewAlpha : null,
@@ -910,6 +959,45 @@ function parseRect(input, width, height) {
     w: Math.min(w, width - x),
     h: Math.min(h, height - y),
   };
+}
+
+/** 点在选区内？rect 直接比范围，lasso 用射线法。 */
+function pointInSelection(x, y, sel) {
+  if (!sel) return true;
+  if (sel.type === "rect") {
+    const r = sel.rect || {};
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+  const pts = sel.points || [];
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i, i += 1) {
+    const xi = pts[i][0];
+    const yi = pts[i][1];
+    const xj = pts[j][0];
+    const yj = pts[j][1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi || 1e-9) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/** 按选区把一笔切成几段：选区外的点丢掉，落笔就「只画框内」。 */
+function clipPoints(points, sel) {
+  if (!sel) return [points];
+  const runs = [];
+  let cur = [];
+  for (const p of points) {
+    const x = Number(p[0]);
+    const y = Number(p[1]);
+    if (pointInSelection(x, y, sel)) cur.push(p);
+    else if (cur.length >= 2) {
+      runs.push(cur);
+      cur = [];
+    } else {
+      cur = [];
+    }
+  }
+  if (cur.length >= 2) runs.push(cur);
+  return runs;
 }
 
 /** 颜色亮度：挑「最像墨」的那一档当线色。支持 {rgb} 或 {hex}。 */
@@ -1714,7 +1802,7 @@ export function apply(ctx, config = {}) {
       properties: {
         action: {
           type: "string",
-          enum: ["doc", "copy", "fix", "draw", "view", "ref", "trace", "pick", "compare", "palette", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
+          enum: ["doc", "copy", "fix", "fill", "draw", "view", "ref", "trace", "pick", "compare", "palette", "select", "snapshot", "restore", "undo", "redo", "clear", "layer", "import", "canvas", "export", "new"],
           description: "要执行的动作。new 是另起一幅（可先保存当前、也可用图片建画布）。",
         },
         points: {
@@ -1838,6 +1926,15 @@ export function apply(ctx, config = {}) {
         target: { type: "number", description: "fix: 目标覆盖率百分比，默认 90。到了就停。" },
         maxRounds: { type: "number", description: "fix: 最多迭代几轮，默认 3（上限 5）。" },
         refLayer: { type: "string", description: "copy / fix: 用哪一个图片层当参考图，默认第一张可见图片层。" },
+        mode: {
+          type: "string",
+          enum: ["edge", "center"],
+          description: "trace: edge 沿墨迹边界（默认，照片/色块用）；center 取骨架中心线（线稿/细线用，描出来更贴原线宽）。",
+        },
+        clearSelection: {
+          type: "boolean",
+          description: "select: 清掉选区，恢复整幅可画。",
+        },
         k: { type: "number", description: "palette: 要几档主色，默认 6（上限 8）。" },
         snapshotId: { type: "string", description: "restore: 回退到哪一版快照（snapshot 返回的 id）；不给回最近一版。" },
         label: { type: "string", description: "snapshot: 这版备注，比如「上色前」。" },
@@ -2149,6 +2246,55 @@ export function apply(ctx, config = {}) {
               hint: "参考图的这块裁切，用 read_image 看。",
             };
           }
+          case "fill": {
+            if (args.x === undefined || args.y === undefined) throw new Error("fill 需要 x、y：区域内部的一个种子点");
+            const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+            const job = await runPixelJob("fill", {
+              x: Math.round(Number(args.x)),
+              y: Math.round(Number(args.y)),
+              rect,
+              color: args.color || null,
+            }, PIXEL_TIMEOUT_MS * 3);
+            if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
+            if (!job.polygons || job.polygons.length === 0) throw new Error("这个种子点没围出可填的区域：先有线稿边界，或者换一个点");
+            const want = String(args.fillLayer || args.layer || "色块").trim();
+            const found = docs.layer(want);
+            const target = found && !found.locked && !found.image ? found : docs.addLayer(want);
+            docs.append(
+              job.polygons.map((p) => ({ mode: "fill", color: job.color, size: 1, opacity: args.opacity === undefined ? 1 : args.opacity, points: p.points })),
+              target.id,
+            );
+            return {
+              ok: true,
+              revision: docs.revision,
+              layer: { id: target.id, name: target.name },
+              color: job.color,
+              area: job.area,
+              polygons: job.polygons.length,
+              seed: job.seed,
+              hint: `填了 ${job.area} 像素，用 ${job.color}；换一个点还能接着填。`,
+            };
+          }
+          case "select": {
+            if (args.clearSelection === true || args.clear === true) {
+              docs.setSelection(null);
+              return { ok: true, revision: docs.revision, selection: null, hint: "选区已清掉，整幅都能画了。" };
+            }
+            if (Array.isArray(args.rect) && args.rect.length >= 4) {
+              const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
+              docs.setSelection({ type: "rect", rect });
+              return { ok: true, revision: docs.revision, selection: docs.doc.selection, hint: `矩形选区 ${rect.w}×${rect.h}：之后落笔只保留框内的点。` };
+            }
+            if (Array.isArray(args.points) && args.points.length >= 3) {
+              const points = args.points
+                .map((p) => [Math.round(Number(p[0])), Math.round(Number(p[1]))])
+                .filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+              if (points.length < 3) throw new Error("套索至少要 3 个点");
+              docs.setSelection({ type: "lasso", points });
+              return { ok: true, revision: docs.revision, selection: docs.doc.selection, hint: `套索选区 ${points.length} 个点：之后落笔只保留圈内的点。` };
+            }
+            throw new Error("select 需要 rect=[x,y,w,h]、points=[[x,y]…]（套索），或 clearSelection=true 清掉");
+          }
           case "copy": {
             const style = args.style === "lineart" || args.style === "flat" ? args.style : "anime";
             const rect = parseRect(args.rect, docs.doc.width, docs.doc.height);
@@ -2281,6 +2427,7 @@ export function apply(ctx, config = {}) {
               tolerance: args.tolerance,
               minLength: args.minLength,
               maxLines: args.maxLines,
+              mode: args.mode === "center" ? "center" : "edge",
             });
             if (!job.ok) return { ok: false, error: job.error, revision: docs.revision };
             return {
