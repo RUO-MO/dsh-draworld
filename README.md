@@ -182,7 +182,7 @@ https://github.com/RUO-MO/dsh-draworld
 
 **像素任务**：裁切、取色、差分、主色这些活在前端算——浏览器早就把参考图解码进 `<canvas>` 了，宿主只搬运，不引 `@napi-rs/canvas` 这类依赖。宿主把任务塞队列，前端 700ms 轮询 `/canvas-api/jobs` 取走，算完 POST `/canvas-api/job`，宿主落盘成 PNG 或转成折线/数值交给模型。超时 5 秒，报错会直说「需要在浏览器里打开画界面板」。
 
-**会话绑定**：工具和画布协议挂在 `agent.ctx` 上，只有打开过画界的会话才有。打开画界时前端 POST `/canvas-api/attach`（带 `sessionId`），关掉 15 秒后 `/detach`；会话未加载时先挂起，`agent/created` 到达即补绑。想退回「所有会话都有」的旧行为：插件配置写 `toolScope: "global"`（不推荐，会把正在写代码的会话带偏）。
+**会话绑定**：工具和画布协议挂在 `agent.ctx` 上，只有打开过画界的会话才有。打开画界时前端 POST `/canvas-api/attach`（带 `sessionId`），关掉 15 秒后 `/detach`。attach 会先按 id 找 agent（`get` 找不到就从列表里翻），找不到就每秒重试、最多 20 秒；20 秒还拿不到就**退回全局注册**（`diagnostics.scope.fallback = "attach-pending"`），保证工具至少能用。想直接退回「所有会话都有」：插件配置写 `toolScope: "global"`（不推荐，会把正在写代码的会话带偏）。
 
 **单一文档**：同一缓存目录只保留一个内存文档（`Document.forDir`，按目录缓存到 `globalThis`），插件被重复加载也不会出现两份各画各的；每次请求与每次工具执行前都核对 `doc.json` mtime，别的窗口刚画过就整份换成更新的那版，避免「模型画了但界面不更新」。
 

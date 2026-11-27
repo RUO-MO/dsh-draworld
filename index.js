@@ -1201,6 +1201,8 @@ export function apply(ctx, config = {}) {
     // 默认按会话绑定：只有打开过画界的那个会话才看得见 paint_canvas。
     // 想退回旧行为（所有会话都有）就在插件配置里写 toolScope: "global"。
     scope: config.toolScope === "global" ? "global" : "session",
+    // 会话补绑 20 秒还没成功，会退回全局注册并把原因记在这（诊断里可见）
+    scopeFallback: null,
     // 版本自检：插件自己去 GitHub 看有没有新 Release，界面上给个提示
     update: { checkedAt: null, latest: null, hasUpdate: false, url: null, error: null, enabled: config.updateCheck !== false },
   };
@@ -1329,6 +1331,58 @@ export function apply(ctx, config = {}) {
   const bound = new Map(); // sessionId -> { agent, disposers: [] }
   const wanted = new Set(); // 打开过画界的会话 id
   const detachTimers = new Map();
+  const bindRetries = new Map(); // sessionId -> 已重试次数
+
+  /** 兜底把工具挂到插件全局：会话补绑失败时至少还能用（诊断里会标 scopeFallback）。 */
+  const enableGlobalFallback = (reason) => {
+    if (state.scope === "global") return false;
+    state.scope = "global";
+    state.scopeFallback = String(reason || "attach-pending");
+    if (prompt) {
+      try {
+        disposers.push(prompt.section({ name: SECTION_NAME, order: SECTION_ORDER, text: PROTOCOL }));
+      } catch (err) {
+        state.toolError = `section: ${(err && err.message) || err}`;
+      }
+    }
+    if (tool) {
+      try {
+        disposers.push(tool.register(definition));
+        state.toolOk = true;
+      } catch (err) {
+        state.toolError = `register: ${(err && err.message) || err}`;
+      }
+    }
+    return true;
+  };
+
+  /** 按 id 找 agent：先 get，再从可能的列表里翻（不同宿主版本的 agents 结构不一样）。 */
+  const resolveAgent = (id) => {
+    if (!id) return null;
+    try {
+      const one = agents && typeof agents.get === "function" ? agents.get(id) : null;
+      if (one && one.ctx) return one;
+    } catch {
+      /* get 不认识这个 id，继续翻列表 */
+    }
+    const pools = [];
+    try {
+      if (agents && typeof agents.list === "function") pools.push(agents.list());
+      if (agents && typeof agents.all === "function") pools.push(agents.all());
+      if (agents && agents.agents instanceof Map) pools.push(agents.agents);
+      if (agents instanceof Map) pools.push(agents);
+    } catch {
+      /* 拿不到列表就算了 */
+    }
+    for (const pool of pools) {
+      const items = pool instanceof Map ? [...pool.values()] : Array.isArray(pool) ? pool : [];
+      for (const a of items) {
+        if (!a || !a.ctx) continue;
+        if (a.id === id || a.sessionId === id || a.conversationId === id) return a;
+      }
+    }
+    return null;
+  };
 
   const bindAgent = (agent) => {
     if (!agent || !agent.ctx || bound.has(agent.id)) return false;
@@ -1377,9 +1431,42 @@ export function apply(ctx, config = {}) {
       detachTimers.delete(id);
     }
     wanted.add(id);
-    const agent = agents && typeof agents.get === "function" ? agents.get(id) : null;
+    const agent = resolveAgent(id);
     const didBind = agent ? bindAgent(agent) : false;
-    return { ok: true, sessionId: id, bound: didBind, pending: !agent, variant: meta.variant || null };
+    if (!didBind) {
+      // 会话在 attach 之前就建好了、又拿不到 agent：定时重试，20 秒还没成再退到全局
+      if (!bindRetries.has(id)) {
+        bindRetries.set(id, 0);
+        const tick = setInterval(() => {
+          if (bound.has(id)) {
+            clearInterval(tick);
+            bindRetries.delete(id);
+            return;
+          }
+          if (!wanted.has(id)) {
+            clearInterval(tick);
+            bindRetries.delete(id);
+            return;
+          }
+          const n = (bindRetries.get(id) || 0) + 1;
+          bindRetries.set(id, n);
+          const found = resolveAgent(id);
+          if (found) {
+            bindAgent(found);
+            clearInterval(tick);
+            bindRetries.delete(id);
+            return;
+          }
+          if (n >= 20) {
+            clearInterval(tick);
+            bindRetries.delete(id);
+            enableGlobalFallback("attach-pending");
+          }
+        }, 1000);
+        if (typeof tick.unref === "function") tick.unref();
+      }
+    }
+    return { ok: true, sessionId: id, bound: didBind, pending: !didBind, variant: meta.variant || null };
   };
 
   /** 前端关掉画界时调用：留 15 秒宽限，切标签时不会来回解绑/重绑。 */
@@ -1461,7 +1548,7 @@ export function apply(ctx, config = {}) {
               plugin: "@xenra/dsh-draworld",
               brushes: BRUSH_IDS.length,
               tools: { service: Boolean(tool), ok: state.toolOk, error: state.toolError },
-              scope: { mode: state.scope, attached: [...wanted], bound: [...bound.keys()] },
+              scope: { mode: state.scope, fallback: state.scopeFallback, attached: [...wanted], bound: [...bound.keys()], retries: [...bindRetries.entries()] },
               routes: { error: state.routeError, origin: state.origin },
               doc: {
                 dir,
